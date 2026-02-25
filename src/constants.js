@@ -21,3 +21,5 @@ export const MESSAGES = {
   moderate: ['Piccolo aggiustamento e sei a posto.', 'Quasi in scia!'],
   critical: ['Recupera il Ghost!', 'Ricalibra al prossimo pasto.'],
 };
+
+export const AMINO_KEYS = ['leucina', 'isoleucina', 'valina'];
