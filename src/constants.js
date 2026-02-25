@@ -23,3 +23,10 @@ export const MESSAGES = {
 };
 
 export const AMINO_KEYS = ['leucina', 'isoleucina', 'valina'];
+
+export const INITIAL_MEALS_DATA = {
+  merenda1: { target: {}, real: {} },
+  pranzo: { target: {}, real: {} },
+  merenda2: { target: {}, real: {} },
+  cena: { target: {}, real: {} },
+};
