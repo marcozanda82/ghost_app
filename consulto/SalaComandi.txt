@@ -1,0 +1,2115 @@
+/**
+ * SalaComandi.jsx — Porting React da index stabile (HTML).
+ * MOTORE BIOCHIMICO (logica pura in useBiochimico.js):
+ * - 40+ parametri: TARGETS + computeTotali (amino, vit, min, omega dal DB cibi).
+ * - Delta correction: calcolaObiettiviPastoConArray in useMemo (target pasti a cascata).
+ * - Firebase: intero albero tracker_data scaricato (get), poi onValue solo per oggi.
+ * - Completamento AI: getDefaultNutrientValue ovunque un valore manca; mai 0 né blocco.
+ */
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { ComposedChart, Line, XAxis, YAxis, ResponsiveContainer, ReferenceLine, ReferenceDot, CartesianGrid, Area, AreaChart, BarChart, Bar, Tooltip } from 'recharts';
+
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getAuth, signInWithEmailAndPassword, onAuthStateChanged } from 'firebase/auth';
+import { getDatabase, ref, get, set, onValue } from 'firebase/database';
+
+import { TARGETS, useBiochimico, getDefaultNutrientValue } from './useBiochimico';
+
+const firebaseConfig = {
+  apiKey: "AIzaSyA5pSzpfq1aGZ1wjNV5-eXnIqWL6brl424",
+  authDomain: "mio-tracker.firebaseapp.com",
+  databaseURL: "https://mio-tracker-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "mio-tracker",
+  storageBucket: "mio-tracker.firebasestorage.app",
+  messagingSenderId: "382993217593",
+  appId: "1:382993217593:web:f0780aa061c23f9503f5e8"
+};
+
+const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
+const auth = getAuth(app);
+const db = getDatabase(app);
+
+const getTodayString = () => new Date().toISOString().split('T')[0];
+const getYesterdayString = () => { const d = new Date(); d.setDate(d.getDate() - 1); return d.toISOString().split('T')[0]; };
+
+/** 🍝 per Pranzo/Cena, 🍎 per gli altri. */
+function getMealIcon(label) {
+  const l = (label || '').toString().toLowerCase();
+  return (l.includes('pranzo') || l.includes('cena')) ? '🍝' : '🍎';
+}
+
+/** Decimale (es. 12.5) -> "HH:mm" per display. */
+function decimalToTimeStr(dec) {
+  if (typeof dec !== 'number' || Number.isNaN(dec)) return '12:00';
+  const h = Math.max(0, Math.min(23, Math.floor(dec)));
+  const m = Math.round((dec - h) * 60) % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+/**
+ * Dati reali + ideali per il cruscotto energetico 0-24h: 25 punti (ore 0..24).
+ * timelineNodes: array di { id, type: 'meal'|'work'|'workout', time, duration?, kcal?, icon }.
+ * idealStrategy: { colazione, pranzo, spuntino, cena, allenamento } kcal obiettivo.
+ * Restituisce { chartData, realTotals } per grafico doppia curva e semafori.
+ */
+function generateRealEnergyData(timelineNodes, dailyLog, idealStrategy) {
+  const log = dailyLog || [];
+  const ideal = idealStrategy || {};
+
+  const mealTypeToKey = (m) => (m === 'merenda1' ? 'colazione' : m === 'merenda2' || m === 'snack' ? 'spuntino' : m || 'cena');
+  let workoutKcal = 0;
+  const realTotals = { colazione: 0, pranzo: 0, spuntino: 0, cena: 0, allenamento: 0 };
+  log.forEach(entry => {
+    const kcal = Number(entry.kcal ?? entry.cal ?? 0) || 0;
+    if (entry.type === 'workout') {
+      workoutKcal += kcal;
+      return;
+    }
+    const mType = entry.mealType || 'cena';
+    const key = mealTypeToKey(mType);
+    realTotals[key] = (realTotals[key] || 0) + kcal;
+  });
+  realTotals.allenamento = workoutKcal;
+
+  let currentEnergy = 70;
+  let currentIdealEnergy = 70;
+  const out = [];
+  for (let h = 0; h <= 24; h++) {
+    currentEnergy -= 2;
+    currentIdealEnergy -= 2;
+
+    (timelineNodes || []).forEach(node => {
+      if (node.type === 'meal' && Math.round(node.time) === h) {
+        const realK = realTotals[node.id] || 0;
+        const idealK = Number(ideal[node.id]) || (node.id === 'spuntino' ? 250 : 500);
+        currentEnergy += realK / 20;
+        currentIdealEnergy += idealK / 20;
+      }
+      if (node.type === 'work' || node.type === 'workout') {
+        const startH = Math.round(node.time);
+        const dur = Math.max(1, Math.round(node.duration || 1));
+        if (h >= startH && h < startH + dur) {
+          const burnKcal = node.kcal || 300;
+          const drain = (burnKcal / dur) / 10;
+          currentEnergy -= drain;
+          currentIdealEnergy -= drain;
+        }
+      }
+    });
+
+    currentEnergy = Math.max(0, Math.min(100, currentEnergy));
+    currentIdealEnergy = Math.max(0, Math.min(100, currentIdealEnergy));
+    out.push({ time: h, energy: currentEnergy, idealEnergy: currentIdealEnergy });
+  }
+  return { chartData: out, realTotals };
+}
+
+/**
+ * Struttura tracker_data (da vecchio storico.html e index_vecchio.html):
+ * Elenco piatto: chiavi trackerStorico_YYYY-MM-DD, nessun annidamento anno/mese.
+ * Ogni valore: { data: string, log: Array, note?: string }.
+ */
+const TRACKER_STORICO_KEY = (date) => `trackerStorico_${date}`;
+
+/** Mappa descrizione pasto (vecchio formato) -> mealId. Usata in normalizeLogData per retrocompatibilità. */
+const DESC_TO_MEAL_ID = {
+  colazione: 'merenda1', 'merenda am': 'merenda1', merenda1: 'merenda1',
+  pranzo: 'pranzo',
+  'merenda pm': 'merenda2', merenda2: 'merenda2',
+  cena: 'cena',
+  snack: 'snack'
+};
+function inferMealType(entry) {
+  if (entry.mealId) return entry.mealId;
+  const key = (entry.desc || '').toLowerCase().trim();
+  return DESC_TO_MEAL_ID[key] || (key ? key.replace(/\s+/g, '_') : null) || 'pranzo';
+}
+
+/** Normalizza log da formato vecchio (meal/items, single, workout) a lista piatta. Compatibile vecchio storico.html. */
+function normalizeLogData(rawLog) {
+  const out = [];
+  (rawLog || []).forEach(entry => {
+    if (entry.type === 'meal') {
+      const mealType = inferMealType(entry);
+      (entry.items || []).forEach(subItem => {
+        out.push({
+          ...subItem, type: 'food', mealType,
+          id: subItem.id || Date.now() + Math.random(),
+          kcal: subItem.kcal ?? subItem.cal ?? 0
+        });
+      });
+    } else if (entry.type === 'single' || !entry.type) {
+      const mealType = inferMealType(entry);
+      out.push({
+        ...entry, type: 'food', mealType,
+        id: entry.id || Date.now() + Math.random(),
+        kcal: entry.kcal ?? entry.cal ?? 0
+      });
+    } else {
+      out.push({ ...entry, kcal: entry.kcal ?? entry.cal ?? 0 });
+    }
+  });
+  return out;
+}
+
+/** Ricostruisce la struttura a "cartelle" (meal/items) per Firebase a partire dal dailyLog piatto. Retrocompatibile con vecchio tracker. */
+const MEAL_ORDER_SAVE = ['merenda1', 'pranzo', 'merenda2', 'cena'];
+const MEAL_LABELS_SAVE = { merenda1: 'Merenda AM', pranzo: 'Pranzo', merenda2: 'Merenda PM', cena: 'Cena', snack: 'Snack', colazione: 'Colazione' };
+function denormalizeLogForFirebase(flatLog) {
+  if (!flatLog || !Array.isArray(flatLog)) return [];
+  const meals = {};
+  const workouts = [];
+  (flatLog || []).forEach(entry => {
+    if (entry.type === 'workout') {
+      workouts.push({ type: 'workout', id: entry.id, desc: entry.desc || entry.name, cal: entry.kcal ?? entry.cal, kcal: entry.kcal ?? entry.cal, duration: entry.duration });
+      return;
+    }
+    if (entry.type === 'food' || !entry.type) {
+      const mealType = entry.mealType || 'cena';
+      if (!meals[mealType]) meals[mealType] = [];
+      const { type, mealType: _, ...rest } = entry;
+      meals[mealType].push({ ...rest, kcal: rest.kcal ?? rest.cal ?? 0, cal: rest.cal ?? rest.kcal ?? 0 });
+    }
+  });
+  const result = [];
+  const order = [...MEAL_ORDER_SAVE];
+  const otherMeals = Object.keys(meals).filter(m => !order.includes(m));
+  [...order, ...otherMeals].forEach(mealId => {
+    if (!meals[mealId] || meals[mealId].length === 0) return;
+    result.push({
+      type: 'meal',
+      mealId,
+      desc: MEAL_LABELS_SAVE[mealId] || mealId,
+      items: meals[mealId].map(it => ({ id: it.id, desc: it.desc || it.name, qta: it.qta ?? it.weight, weight: it.weight ?? it.qta, prot: it.prot, kcal: it.kcal, cal: it.cal, ...it }))
+    });
+  });
+  result.push(...workouts);
+  return result;
+}
+
+/** Dato l'albero tracker_data scaricato (una tantum), restituisce il log normalizzato per una data. Chiave = trackerStorico_YYYY-MM-DD. */
+function getLogFromStoricoTree(tree, dateStr) {
+  if (!tree || !dateStr) return [];
+  const node = tree[TRACKER_STORICO_KEY(dateStr)];
+  const log = node?.log ?? node?.dati?.log;
+  return normalizeLogData(log ?? []);
+}
+
+const STRATEGY_PROFILES = {
+  upper:  { label: '💪 UPPER', kcal: 2300 },
+  gambe:  { label: '🦵 GAMBE', kcal: 2500 },
+  riposo: { label: '🧘 RIPOSO', kcal: 2000 }
+};
+
+/** Per calcolo Deficit/Surplus nello storico (come vecchio storico.html) */
+const PIANO_SETTIMANALE = {
+  0: { cal: 2300, prot: 140 },
+  1: { cal: 2300, prot: 140 },
+  2: { cal: 2300, prot: 140 },
+  3: { cal: 2300, prot: 140 },
+  4: { cal: 2300, prot: 140 },
+  5: { cal: 2300, prot: 140 },
+  6: { cal: 2300, prot: 140 }
+};
+
+export default function SalaComandi() {
+  // AUTENTICAZIONE
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [userUid, setUserUid] = useState(null);
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [isBooting, setIsBooting] = useState(false);
+
+  // STATI INTERFACCIA
+  const [currentTime, setCurrentTime] = useState(8);
+  const [showDetails, setShowDetails] = useState(false);
+  const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+  const [activeAction, setActiveAction] = useState(null); 
+  
+  const [selectedHistoryDate, setSelectedHistoryDate] = useState('');
+
+  // SOTTO-NAVIGAZIONE DIARIO
+  const [diarioTab, setDiarioTab] = useState('storico'); // per diario_giornaliero: 'storico' = log oggi, 'telemetria' = telemetria
+  const [telemetrySubTab, setTelemetrySubTab] = useState('macro'); // 'macro'|'bilanci'|'amino'|'vit'|'min'|'fat'
+  const [expandedStoricoDate, setExpandedStoricoDate] = useState(null); // data string (YYYY-MM-DD) del giorno espanso nell'archivio
+
+  // STRATEGIA E DATABASE
+  const [dayProfile, setDayProfile] = useState('upper');
+  const [calorieTuning, setCalorieTuning] = useState(0);
+  const [foodDb, setFoodDb] = useState({});
+  const [dailyLog, setDailyLog] = useState([]);
+  
+  // STATI MODULI (Pasti, Acqua, Allenamento, Zen)
+  const [mealType, setMealType] = useState('cena');
+  const [drawerMealTime, setDrawerMealTime] = useState(12);
+  const [drawerMealTimeStr, setDrawerMealTimeStr] = useState('12:00');
+  const [foodNameInput, setFoodNameInput] = useState('');
+  const [foodWeightInput, setFoodWeightInput] = useState('');
+  const [addedFoods, setAddedFoods] = useState([]);
+  const [selectedFoodForCard, setSelectedFoodForCard] = useState(null);
+  // Dropdown autocompletamento alimenti
+  const [foodDropdownSuggestions, setFoodDropdownSuggestions] = useState([]);
+  const [showFoodDropdown, setShowFoodDropdown] = useState(false);
+  const [isGeneratingFood, setIsGeneratingFood] = useState(false);
+  const [isBarcodeScannerOpen, setIsBarcodeScannerOpen] = useState(false);
+  const barcodeVideoRef = useRef(null);
+  const barcodeStreamRef = useRef(null);
+  const barcodeScanIntervalRef = useRef(null);
+  // Modali Info / Edit pillole
+  const [selectedFoodForInfo, setSelectedFoodForInfo] = useState(null);
+  const [selectedFoodForEdit, setSelectedFoodForEdit] = useState(null);
+  const [nutrientModal, setNutrientModal] = useState(null);
+  const [showNodeModal, setShowNodeModal] = useState(false);
+  const [nodeForm, setNodeForm] = useState({ id: null, type: 'meal', start: 12, end: 16, kcal: 400 });
+  const [editQuantityValue, setEditQuantityValue] = useState(''); 
+  
+  const [workoutType, setWorkoutType] = useState('pesi');
+  const [workoutKcal, setWorkoutKcal] = useState(300);
+  
+  const [waterIntake, setWaterIntake] = useState(0);
+  const dailyWaterGoal = 2500; 
+  const [isZenActive, setIsZenActive] = useState(false);
+
+  // AI ASSISTANT E CLUSTER
+  const [apiKeys, setApiKeys] = useState(() => JSON.parse(localStorage.getItem('ghost_api_cluster')) || ['']);
+  const [activeKeyIndex, setActiveKeyIndex] = useState(0);
+  const [showAiSettings, setShowAiSettings] = useState(false);
+  const [chatInput, setChatInput] = useState('');
+  const [chatHistory, setChatHistory] = useState([
+    { sender: 'ai', text: 'VYTA SYS ONLINE. Interfaccia Premium e Motore Biochimico allineati.' }
+  ]);
+  const chatEndRef = useRef(null);
+  /** Ref robusto: conserva il log normalizzato ricevuto da Firebase; il salvataggio viene saltato solo se dailyLog coincide con questo snapshot. */
+  const lastLogFromFirebaseRef = useRef(null);
+  /** Valvola di sicurezza: nessun set() su Firebase finché il primo caricamento non è completato (evita race condition e perdita dati). */
+  const [isInitialLoadComplete, setIsInitialLoadComplete] = useState(false);
+
+  // PARAMETRI ANIMAZIONI SVG
+  /** Albero completo tracker_data (download una tantum). Struttura piatta: trackerStorico_YYYY-MM-DD -> { data, log, note? }. */
+  const [fullStorico, setFullStorico] = useState(null);
+
+  /** Strategia ideale (obiettivi AI) per confronto con dati reali */
+  const [idealStrategy, setIdealStrategy] = useState(() => {
+    const saved = localStorage.getItem('vyta_idealStrategy');
+    return saved ? JSON.parse(saved) : { colazione: 400, pranzo: 700, spuntino: 250, cena: 500, allenamento: 300 };
+  });
+
+  /** Grafico energia: lucchetto e timeline trascinabile. Solo Work/Workout in stato; i pasti derivano dal diario. */
+  const [isGraphUnlocked, setIsGraphUnlocked] = useState(false);
+  const [manualNodes, setManualNodes] = useState(() => {
+    const saved = localStorage.getItem('vyta_timeline');
+    const parsed = saved ? JSON.parse(saved) : [
+      { id: 'lavoro_mat', type: 'work', time: 9, duration: 4, kcal: 400, icon: '💼' },
+      { id: 'lavoro_pom', type: 'work', time: 14, duration: 4, kcal: 400, icon: '💼' },
+      { id: 'allenamento', type: 'workout', time: 18, duration: 1, kcal: 300, icon: '🏋️' }
+    ];
+    return (Array.isArray(parsed) ? parsed : []).filter(n => n.type === 'work' || n.type === 'workout');
+  });
+  const [draggingNode, setDraggingNode] = useState(null);
+  const timelineContainerRef = useRef(null);
+
+  const computedMealNodes = useMemo(() => {
+    const byMeal = {};
+    (dailyLog || []).filter(i => i.type === 'food').forEach(f => {
+      const key = f.mealType || 'cena';
+      if (!byMeal[key]) byMeal[key] = { mealType: key, time: f.mealTime ?? 12 };
+      byMeal[key].time = f.mealTime ?? byMeal[key].time;
+    });
+    return Object.values(byMeal).map(m => ({ id: m.mealType, type: 'meal', time: m.time, icon: getMealIcon(m.mealType) }));
+  }, [dailyLog]);
+
+  const allNodes = useMemo(() => {
+    return [...computedMealNodes, ...manualNodes].sort((a, b) => a.time - b.time);
+  }, [computedMealNodes, manualNodes]);
+
+  useEffect(() => {
+    localStorage.setItem('vyta_timeline', JSON.stringify(manualNodes));
+  }, [manualNodes]);
+
+  /** All'avvio: ripristina manualNodes (Lavoro/Sport) da Firebase. Oggi se salvato, altrimenti ultimo giorno con dati. */
+  useEffect(() => {
+    if (!fullStorico || typeof fullStorico !== 'object') return;
+    const todayKey = TRACKER_STORICO_KEY(getTodayString());
+    const todayNode = fullStorico[todayKey];
+    if (todayNode?.manualNodes?.length > 0) {
+      setManualNodes(todayNode.manualNodes);
+      return;
+    }
+    const keys = Object.keys(fullStorico).filter(k => k.startsWith('trackerStorico_'));
+    keys.sort((a, b) => b.localeCompare(a));
+    for (const key of keys) {
+      if (key === todayKey) continue;
+      const node = fullStorico[key];
+      const nodes = node?.manualNodes;
+      if (Array.isArray(nodes) && nodes.length > 0) {
+        setManualNodes(nodes);
+        break;
+      }
+    }
+  }, [fullStorico]);
+
+  useEffect(() => {
+    localStorage.setItem('vyta_idealStrategy', JSON.stringify(idealStrategy));
+  }, [idealStrategy]);
+
+  useEffect(() => {
+    let unsubToday = null;
+    const unsubAuth = onAuthStateChanged(auth, (user) => {
+      if (!user) {
+        unsubToday?.();
+        setIsInitialLoadComplete(false);
+        return;
+      }
+      setUserUid(user.uid);
+      setIsAuthenticated(true);
+      setIsInitialLoadComplete(false);
+      const today = getTodayString();
+      const basePath = `users/${user.uid}/tracker_data`;
+
+      get(ref(db, basePath)).then(snap => {
+        const tree = snap.exists() ? snap.val() : null;
+        setFullStorico(tree);
+        setDailyLog(getLogFromStoricoTree(tree, today));
+        unsubToday = onValue(ref(db, `${basePath}/${TRACKER_STORICO_KEY(today)}`), (liveSnap) => {
+          if (liveSnap.exists()) {
+            const incomingLog = liveSnap.val()?.log ?? [];
+            const normalized = normalizeLogData(incomingLog);
+            lastLogFromFirebaseRef.current = JSON.stringify(normalized);
+            setDailyLog(normalized);
+          }
+        });
+        setIsInitialLoadComplete(true);
+        console.log('Firebase Sync: Pronto - Salvataggio consentito');
+      });
+
+      get(ref(db, `${basePath}/trackerFoodDatabase`)).then(s => { if (s.exists()) setFoodDb(s.val()); });
+    });
+    return () => { unsubAuth(); unsubToday?.(); };
+  }, []);
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setIsBooting(true);
+    try {
+      await signInWithEmailAndPassword(auth, loginEmail, loginPassword);
+    } catch (error) {
+      alert("ACCESSO NEGATO: Controlla le credenziali.");
+      setIsBooting(false);
+    }
+  };
+
+  useEffect(() => {
+    if(!isAuthenticated) return;
+    const updateTime = () => {
+      const now = new Date();
+      let decimalTime = now.getHours() + now.getMinutes() / 60;
+      setCurrentTime(decimalTime < 8 ? 8 : decimalTime > 23 ? 23 : decimalTime);
+    };
+    updateTime(); 
+    const interval = setInterval(updateTime, 60000); 
+    return () => clearInterval(interval);
+  }, [isAuthenticated]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !userUid) return;
+    if (!isInitialLoadComplete) {
+      console.log('Firebase Sync: Bloccato - Caricamento in corso');
+      return;
+    }
+    if (dailyLog.length > 0 && lastLogFromFirebaseRef.current !== null) {
+      const skip = JSON.stringify(dailyLog) === lastLogFromFirebaseRef.current;
+      lastLogFromFirebaseRef.current = null;
+      if (skip) return;
+    }
+    const today = getTodayString();
+    const logForFirebase = denormalizeLogForFirebase(dailyLog);
+    const mealTimes = (dailyLog || []).filter(i => i.type === 'food').reduce((acc, f) => ({ ...acc, [f.mealType]: f.mealTime ?? 12 }), {});
+    const payload = { data: today, log: logForFirebase, mealTimes, manualNodes: manualNodes || [] };
+    const MAX_STRIP_DEPTH = 25;
+    const sanitized = (function stripUndefined(obj, depth) {
+      if (depth > MAX_STRIP_DEPTH) return obj;
+      const d = depth ?? 0;
+      if (obj === undefined) return null;
+      if (obj === null) return null;
+      if (Array.isArray(obj)) return obj.map((v, i) => stripUndefined(v, d + 1)).filter((v) => v !== undefined);
+      if (typeof obj === 'object') {
+        const out = {};
+        for (const k of Object.keys(obj)) {
+          const v = stripUndefined(obj[k], d + 1);
+          if (v !== undefined) out[k] = v;
+        }
+        return out;
+      }
+      return obj;
+    })(payload, 0);
+    set(ref(db, `users/${userUid}/tracker_data/${TRACKER_STORICO_KEY(today)}`), sanitized)
+      .catch(err => console.error("Errore salvataggio Cloud:", err));
+  }, [dailyLog, isAuthenticated, userUid, manualNodes, isInitialLoadComplete]);
+
+  useEffect(() => {
+    const q = (foodNameInput || '').trim().toLowerCase();
+    if (!q) {
+      setFoodDropdownSuggestions([]);
+      return;
+    }
+    const keys = Object.keys(foodDb || {});
+    const matches = keys
+      .filter(k => {
+        const d = foodDb[k];
+        const desc = (d?.desc || d?.name || '').toLowerCase();
+        return desc.includes(q);
+      })
+      .slice(0, 10)
+      .map(k => ({ key: k, desc: foodDb[k]?.desc || foodDb[k]?.name || k }));
+    setFoodDropdownSuggestions(matches);
+  }, [foodNameInput, foodDb]);
+
+  useEffect(() => {
+    if (!draggingNode) return;
+    const onMove = (e) => {
+      const el = timelineContainerRef.current;
+      if (!el || !draggingNode) return;
+      const rect = el.getBoundingClientRect();
+      const percent = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const hour = Math.round(percent * 24 * 4) / 4;
+
+      const node = allNodes.find(n => n.id === draggingNode.id);
+      if (node?.type === 'meal') {
+        setDailyLog(prev => prev.map(item => item.type === 'food' && item.mealType === draggingNode.id ? { ...item, mealTime: hour } : item));
+      } else {
+        setManualNodes(prev => prev.map(n => {
+          if (n.id !== draggingNode.id) return n;
+          if (n.type === 'work') {
+            if (draggingNode.edge === 'start') {
+              const end = n.time + (n.duration || 1);
+              const newTime = Math.min(hour, end - 0.25);
+              return { ...n, time: newTime, duration: end - newTime };
+            }
+            if (draggingNode.edge === 'end') {
+              const newEnd = Math.max(hour, n.time + 0.25);
+              return { ...n, duration: newEnd - n.time };
+            }
+          }
+          return { ...n, time: hour };
+        }));
+      }
+    };
+    const onUp = () => setDraggingNode(null);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+  }, [draggingNode, allNodes]);
+
+  useEffect(() => {
+    if (activeAction === 'ai_chat' && chatEndRef.current) chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
+  }, [chatHistory, activeAction]);
+
+  useEffect(() => { if (!isDrawerOpen) setIsZenActive(false); }, [isDrawerOpen]);
+
+  useEffect(() => {
+    if (isDrawerOpen && activeAction === 'pasto' && drawerMealTimeStr === '') setDrawerMealTimeStr(decimalToTimeStr(drawerMealTime));
+  }, [isDrawerOpen, activeAction]);
+
+  // Motore biochimico: totali (40+ parametri) + obiettivi a cascata (delta correction)
+  const baseKcal = STRATEGY_PROFILES[dayProfile].kcal + calorieTuning;
+  const { totali, obiettiviPasti } = useBiochimico(dailyLog, baseKcal);
+  const targetKcal = baseKcal + (totali?.workout ?? 0);
+
+  const openDrawer = () => { setActiveAction(null); setIsDrawerOpen(true); };
+  const closeDrawer = () => { setIsDrawerOpen(false); setTimeout(() => setActiveAction(null), 400); };
+
+  const getDefaultMealTime = (mealTypeKey) => {
+    const first = (dailyLog || []).find(item => item.type === 'food' && item.mealType === mealTypeKey);
+    if (first != null && typeof first.mealTime === 'number') return first.mealTime;
+    if (!fullStorico) return 12;
+    const keys = Object.keys(fullStorico).filter(k => k.startsWith('trackerStorico_'));
+    keys.sort((a, b) => b.localeCompare(a));
+    const todayKey = TRACKER_STORICO_KEY(getTodayString());
+    for (const key of keys) {
+      if (key === todayKey) continue;
+      const dayData = fullStorico[key];
+      const t = dayData?.mealTimes?.[mealTypeKey];
+      if (typeof t === 'number') return t;
+    }
+    return 12;
+  };
+
+  const handleTimeInput = (value) => {
+    const digits = (value || '').replace(/\D/g, '');
+    if (digits.length === 0) {
+      setDrawerMealTimeStr('');
+      setDrawerMealTime(12);
+      return;
+    }
+    let formatted = digits.slice(0, 4);
+    if (formatted.length > 2) formatted = formatted.slice(0, 2) + ':' + formatted.slice(2);
+    if (digits.length > 4) formatted = digits.slice(0, 2) + ':' + digits.slice(2, 4);
+    setDrawerMealTimeStr(formatted);
+    const [hh, mm] = formatted.includes(':') ? formatted.split(':') : [formatted.slice(0, 2) || '0', formatted.slice(2) || '0'];
+    const h = Math.min(23, Math.max(0, parseInt(hh, 10) || 0));
+    const m = Math.min(59, Math.max(0, parseInt(mm, 10) || 0));
+    setDrawerMealTime(h + m / 60);
+  };
+
+  const getLastQuantityForFood = (desc) => {
+    if (!fullStorico || !desc) return null;
+    const keys = Object.keys(fullStorico).filter(k => k.startsWith('trackerStorico_'));
+    keys.sort((a, b) => b.localeCompare(a));
+    const norm = (s) => (s || '').toLowerCase().trim();
+    const target = norm(desc);
+    for (const key of keys) {
+      const log = fullStorico[key]?.log;
+      if (!Array.isArray(log)) continue;
+      const flat = normalizeLogData(log);
+      const found = flat.filter(i => i.type === 'food').find(i => norm(i.desc || i.name) === target || norm(i.desc || i.name).includes(target) || target.includes(norm(i.desc || i.name)));
+      if (found != null && (found.qta != null || found.weight != null)) return String(found.qta ?? found.weight ?? '');
+    }
+    return null;
+  };
+
+  const fetchOpenFoodFactsProduct = async (barcode) => {
+    const res = await fetch(`https://world.openfoodfacts.org/api/v2/product/${barcode}.json?fields=product_name,ingredients_text_it,ingredients_text,nutriments`);
+    const data = await res.json();
+    if (data.status === 0 || !data.product) return null;
+    const p = data.product;
+    const nut = p.nutriments || {};
+    const toNum = (v) => (v != null && v !== '' ? parseFloat(v) : undefined);
+    const entryPer100 = {
+      desc: p.product_name || `Barcode ${barcode}`,
+      kcal: toNum(nut['energy-kcal_100g']) ?? toNum(nut['energy_100g']) ? (nut['energy_100g'] / 4.184) : undefined,
+      prot: toNum(nut.proteins_100g),
+      carb: toNum(nut.carbohydrates_100g),
+      fatTotal: toNum(nut.fat_100g),
+      fibre: toNum(nut.fiber_100g)
+    };
+    ['sugars_100g', 'saturated-fat_100g', 'salt_100g', 'sodium_100g', 'calcium_100g', 'iron_100g', 'potassium_100g', 'vitamin-c_100g', 'vitamin-d_100g'].forEach((key, i) => {
+      const our = ['zuccheri', 'fatSat', 'sale', 'na', 'ca', 'fe', 'k', 'vitc', 'vitD'][i];
+      if (our && nut[key] != null) entryPer100[our] = parseFloat(nut[key]);
+    });
+    return entryPer100;
+  };
+
+  const handleBarcodeDetected = useCallback(async (barcode) => {
+    setIsBarcodeScannerOpen(false);
+    if (barcodeStreamRef.current) {
+      barcodeStreamRef.current.getTracks().forEach(t => t.stop());
+      barcodeStreamRef.current = null;
+    }
+    if (barcodeScanIntervalRef.current) clearInterval(barcodeScanIntervalRef.current);
+    try {
+      const entryPer100 = await fetchOpenFoodFactsProduct(barcode);
+      const name = entryPer100?.desc || `Barcode ${barcode}`;
+      if (entryPer100 && userUid) {
+        Object.keys(TARGETS).forEach(g => Object.keys(TARGETS[g] || {}).forEach(k => { if (entryPer100[k] == null) entryPer100[k] = getDefaultNutrientValue(k); }));
+        if (entryPer100.kcal == null) entryPer100.kcal = getDefaultNutrientValue('kcal');
+        const newKey = `food_${Date.now()}_${name.replace(/\s+/g, '_').slice(0, 20)}`;
+        const basePath = `users/${userUid}/tracker_data`;
+        await set(ref(db, `${basePath}/trackerFoodDatabase/${newKey}`), entryPer100);
+        setFoodDb(prev => ({ ...prev, [newKey]: entryPer100 }));
+      }
+      setFoodNameInput(name);
+      setFoodWeightInput(getLastQuantityForFood(name) || '100');
+      setTimeout(() => document.getElementById('weight-input')?.focus(), 100);
+    } catch (e) {
+      setFoodNameInput(`Barcode ${barcode}`);
+      setFoodWeightInput('100');
+      setTimeout(() => document.getElementById('weight-input')?.focus(), 100);
+    }
+  }, [foodDb, userUid]);
+
+  useEffect(() => {
+    if (!isBarcodeScannerOpen || !barcodeVideoRef.current) return;
+    if (!('BarcodeDetector' in window)) {
+      alert('Il browser non supporta la scansione barcode. Prova Chrome su Android.');
+      setIsBarcodeScannerOpen(false);
+      return;
+    }
+    let stream = null;
+    const barcodeDetector = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e'] });
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+      .then(s => {
+        stream = s;
+        barcodeStreamRef.current = s;
+        if (barcodeVideoRef.current) {
+          barcodeVideoRef.current.srcObject = s;
+          barcodeVideoRef.current.play();
+        }
+        barcodeScanIntervalRef.current = setInterval(async () => {
+          if (!barcodeVideoRef.current || !stream) return;
+          try {
+            const barcodes = await barcodeDetector.detect(barcodeVideoRef.current);
+            if (barcodes.length > 0) {
+              const code = barcodes[0].rawValue;
+              handleBarcodeDetected(code);
+            }
+          } catch (_) {}
+        }, 200);
+      })
+      .catch(() => {
+        alert('Impossibile accedere alla fotocamera.');
+        setIsBarcodeScannerOpen(false);
+      });
+    return () => {
+      if (barcodeScanIntervalRef.current) clearInterval(barcodeScanIntervalRef.current);
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      barcodeStreamRef.current = null;
+    };
+  }, [isBarcodeScannerOpen, handleBarcodeDetected]);
+
+  const loadMealToConstructor = (mType) => {
+    setAddedFoods([]);
+    const items = (dailyLog || []).filter(item => item.type === 'food' && item.mealType === mType).map(f => ({ ...f }));
+    setMealType(mType);
+    const t = getDefaultMealTime(mType);
+    setDrawerMealTime(t);
+    setDrawerMealTimeStr(decimalToTimeStr(t));
+    setAddedFoods(items);
+    setActiveAction('pasto');
+    setIsDrawerOpen(true);
+  };
+  
+  // Estrazione dati da DB: tutti i 40+ parametri. Se un valore manca, usa stima (regola AI: mai 0 né blocco).
+  const estraiDatiFoodDb = useCallback((nome, qta, pastoType) => {
+    const foodItem = Object.assign(
+      { id: Date.now() + Math.random(), type: 'food', mealType: pastoType, desc: nome, qta, weight: qta, kcal: 0, cal: 0 },
+      ...Object.keys(TARGETS).flatMap(g => Object.keys(TARGETS[g]).map(k => ({ [k]: undefined })))
+    );
+    const dbKey = Object.keys(foodDb).find(k => foodDb[k].desc?.toLowerCase().includes(nome.toLowerCase()));
+    if (dbKey) {
+      const dbF = foodDb[dbKey];
+      Object.keys(dbF || {}).forEach(k => { if (typeof dbF[k] === 'number' && k !== 'id') foodItem[k] = (dbF[k] / 100) * qta; });
+      foodItem.kcal = foodItem.kcal || foodItem.cal || 0;
+      foodItem.cal = foodItem.cal ?? foodItem.kcal;
+      Object.keys(TARGETS).forEach(g => Object.keys(TARGETS[g]).forEach(k => {
+        if (foodItem[k] == null || foodItem[k] === 0) foodItem[k] = getDefaultNutrientValue(k);
+      }));
+      if (!foodItem.kcal || foodItem.kcal === 0) foodItem.kcal = getDefaultNutrientValue('kcal');
+    } else {
+      foodItem.kcal = getDefaultNutrientValue('kcal');
+      foodItem.cal = foodItem.kcal;
+      foodItem.prot = getDefaultNutrientValue('prot');
+      foodItem.carb = getDefaultNutrientValue('carb');
+      foodItem.fatTotal = getDefaultNutrientValue('fatTotal');
+      Object.values(TARGETS).forEach(g => Object.keys(g || {}).forEach(k => { if (foodItem[k] == null) foodItem[k] = getDefaultNutrientValue(k); }));
+    }
+    return foodItem;
+  }, [foodDb]);
+
+  const handleAddFoodManual = () => {
+    if (!foodNameInput || !foodWeightInput) return;
+    const item = estraiDatiFoodDb(foodNameInput.trim(), parseFloat(foodWeightInput), mealType);
+    setAddedFoods([item, ...addedFoods]);
+    setFoodNameInput(''); setFoodWeightInput('');
+  };
+
+  const saveMealToDiary = () => {
+    const currentMealType = mealType;
+    const timeToUse = typeof drawerMealTime === 'number' && !Number.isNaN(drawerMealTime) ? drawerMealTime : 12;
+    const mealItems = addedFoods.map(f => ({ ...f, mealType: currentMealType, mealTime: timeToUse }));
+    const rest = dailyLog.filter(item => item.type !== 'food' || item.mealType !== currentMealType);
+    setDailyLog([...mealItems, ...rest]); setAddedFoods([]); closeDrawer();
+  };
+
+  const saveNewTimelineNode = () => {
+    const isWork = nodeForm.type === 'work';
+    const isWorkout = nodeForm.type === 'workout';
+    if (nodeForm.type === 'meal') {
+      setMealType('cena');
+      const t = Number(nodeForm.start) || 12;
+      setDrawerMealTime(t);
+      setDrawerMealTimeStr(decimalToTimeStr(t));
+      setActiveAction('pasto');
+      setIsDrawerOpen(true);
+      setShowNodeModal(false);
+      return;
+    }
+    const duration = isWork ? Math.max(0.5, Number(nodeForm.end) - Number(nodeForm.start)) : (isWorkout ? 1 : undefined);
+    const kcal = (isWork || isWorkout) ? Number(nodeForm.kcal) : undefined;
+    const icon = isWork ? '💼' : '🏋️';
+
+    if (nodeForm.id) {
+      setManualNodes(prev => prev.map(n => n.id === nodeForm.id ? { ...n, type: nodeForm.type, time: Number(nodeForm.start), duration, kcal, icon } : n));
+    } else {
+      const newNode = { id: nodeForm.type + '_' + Date.now(), type: nodeForm.type, time: Number(nodeForm.start), duration, kcal, icon };
+      setManualNodes(prev => [...prev, newNode]);
+    }
+    setShowNodeModal(false);
+  };
+
+  const handleNodeClick = (node) => {
+    if (!isGraphUnlocked) {
+      if (node.type === 'meal') {
+        const mealTypeId = node.id;
+        loadMealToConstructor(mealTypeId);
+        setDrawerMealTime(node.time);
+        setDrawerMealTimeStr(decimalToTimeStr(node.time));
+        return;
+      }
+      setNodeForm({ id: node.id, type: node.type, start: node.time, end: node.time + (node.duration || 1), kcal: node.kcal || 400 });
+      setShowNodeModal(true);
+    }
+  };
+
+  const handleAddWater = (amount) => { setWaterIntake(prev => prev + amount < 0 ? 0 : prev + amount); };
+  
+  const handleSaveWorkout = () => {
+    const newWorkout = {
+      id: Date.now(), type: 'workout', workoutType,
+      desc: workoutType === 'pesi' ? 'Sollevamento Pesi' : workoutType === 'cardio' ? 'Cardio / Corsa' : workoutType === 'hiit' ? 'HIIT / Circuito' : 'Attività Lavorativa',
+      kcal: workoutKcal, duration: Math.floor(workoutKcal / (workoutType === 'lavoro' ? 3 : 8)) 
+    };
+    setDailyLog([newWorkout, ...dailyLog]); setWorkoutKcal(300);
+  };
+  
+  const removeLogItem = (id) => { setDailyLog(dailyLog.filter(item => item.id !== id)); };
+
+  // --- CLUSTER AI GEMINI ---
+  const handleAddKey = () => { setApiKeys([...apiKeys, '']); };
+  const handleKeyChange = (index, value) => { const newKeys = [...apiKeys]; newKeys[index] = value; setApiKeys(newKeys); };
+  const handleRemoveKey = (index) => { const newKeys = apiKeys.filter((_, i) => i !== index); if(newKeys.length === 0) newKeys.push(''); setApiKeys(newKeys); };
+  const saveApiCluster = () => { localStorage.setItem('ghost_api_cluster', JSON.stringify(apiKeys)); setShowAiSettings(false); };
+
+  const callGeminiAPIWithRotation = async (promptText) => {
+    const validKeys = apiKeys.filter(k => k.trim() !== '');
+    if (validKeys.length === 0) throw new Error("Nessuna API Key configurata.");
+    let attempt = 0;
+    while (attempt < validKeys.length) {
+      const currentIndex = (activeKeyIndex + attempt) % validKeys.length;
+      const currentKey = validKeys[currentIndex];
+      try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${currentKey}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: promptText }] }], generationConfig: { temperature: 0.1 } })
+        });
+        if (!response.ok) { if (response.status === 429) { attempt++; continue; } throw new Error(`Errore Server: ${response.status}`); }
+        const data = await response.json();
+        if (attempt > 0) setActiveKeyIndex(currentIndex);
+        return data.candidates[0].content.parts[0].text;
+      } catch (e) { if (attempt === validKeys.length - 1) throw e; attempt++; }
+    }
+    throw new Error("Cluster API esaurito.");
+  };
+
+  const handleChatSubmit = async () => {
+    if (!chatInput.trim()) return;
+    const userText = chatInput.trim();
+    setChatHistory(prev => [...prev, { sender: 'user', text: userText }]);
+    setChatInput(''); setChatHistory(prev => [...prev, { sender: 'ai', isTyping: true }]);
+
+    try {
+      const energyResult = generateRealEnergyData(allNodes, dailyLog || [], idealStrategy);
+      const chartData = energyResult?.chartData || [];
+      const energyAt20 = chartData[20]?.energy;
+
+      const systemContext = `
+[CONTESTO DI SISTEMA INVISIBILE - NON MENZIONARLO ALL'UTENTE]
+Stato attuale cruscotto:
+- Timeline (nodi): ${JSON.stringify(allNodes.map(n => ({ id: n.id, type: n.type, time: n.time, duration: n.duration, kcal: n.kcal })))}
+- Strategia ideale attuale (kcal): ${JSON.stringify(idealStrategy)}
+- Rischio stress serale (energia < 40 alle ore 20): ${energyAt20 != null && energyAt20 < 40 ? 'ALTO (Intervenire)' : 'Basso'}
+- Carenza Omega3: ${(Number(totali?.omega3) ?? 0) < 1 ? 'SI' : 'NO'}
+- Storico ultimi 3 giorni: ${JSON.stringify(pastDaysStorico.slice(0, 3).map(d => ({ data: d.dataStr, kcal: Math.round(d.calorie), prot: Math.round(d.proteine), deficit: d.deficit })))}
+
+REGOLE TASSATIVE PER LA TUA RISPOSTA:
+1. Se l'utente chiede una strategia o descrive la giornata, analizza i dati. Se vedi rischio stress serale, modifica la strategia per aggiungere un pasto tattico prima di cena.
+2. Quando un valore nutrizionale non è disponibile per la compilazione automatica, fai una stima e usa il valore medio.
+3. Per modificare la strategia o gli orari, devi inserire alla fine della risposta questo comando esatto (puoi omettere i campi che non cambi):
+[STRATEGIA: colazione=400, pranzo=700, spuntino=250, cena=500, allenamento=300, orario_allenamento=18]
+4. Se l'utente chiede un bilancio, un'analisi dei giorni scorsi o come sta andando la settimana, basati sui dati dello "Storico ultimi 3 giorni" per dare un feedback personalizzato.
+`;
+
+      const prompt = systemContext + `\n\nAnalizza: "${userText}". CASO CIBO: Rispondi [AGGIUNGI: nome | grammi | pasto]. Se no grammi, scrivi 0. CASO ALLENAMENTO: Rispondi [ALLENAMENTO: descrizione | kcal]. STIMA kcal se mancano. Rispondi SOLO con i comandi tra parentesi quadre.`;
+      const responseText = await callGeminiAPIWithRotation(prompt);
+      let foundAny = false; let newLogItems = [];
+
+      const regexFood = /\[AGGIUNGI:\s*([^|\]]+?)\s*\|\s*([0-9.,]+)\s*\|\s*([^\]]+?)\]/gi;
+      let matchFood;
+      while ((matchFood = regexFood.exec(responseText)) !== null) {
+          foundAny = true;
+          const grammi = parseFloat(matchFood[2].replace(',', '.'));
+          const qta = (typeof grammi === 'number' && !Number.isNaN(grammi) && grammi > 0) ? grammi : 100;
+          const pastoF = matchFood[3].trim().toLowerCase() === 'merenda' ? 'merenda1' : matchFood[3].trim().toLowerCase();
+          newLogItems.push(estraiDatiFoodDb(matchFood[1].trim(), qta, pastoF));
+      }
+
+      const regexWorkout = /\[ALLENAMENTO:\s*([^|\]]+?)\s*\|\s*([0-9.,]+)\]/gi;
+      let matchWorkout;
+      while ((matchWorkout = regexWorkout.exec(responseText)) !== null) {
+          foundAny = true;
+          const kcalRaw = parseFloat(matchWorkout[2].replace(',', '.'));
+          const kcal = (typeof kcalRaw === 'number' && !Number.isNaN(kcalRaw) && kcalRaw > 0) ? kcalRaw : 300;
+          newLogItems.push({ id: Date.now() + Math.random(), type: 'workout', workoutType: 'misto', desc: matchWorkout[1].trim().toUpperCase(), kcal, duration: Math.floor(kcal / 6) });
+      }
+
+      const regexStrategia = /\[STRATEGIA:\s*(.+?)\]/gi;
+      let matchStrategia;
+      while ((matchStrategia = regexStrategia.exec(responseText)) !== null) {
+          const pairs = matchStrategia[1].split(',');
+          const newStrategy = { ...idealStrategy };
+          const timeUpdates = {};
+          pairs.forEach(pair => {
+              const [key, val] = pair.split('=').map(s => (s || '').trim().toLowerCase());
+              const numVal = parseFloat(val);
+              if (!isNaN(numVal) && key) {
+                  if (key.startsWith('orario_')) {
+                      const timeKey = key.replace('orario_', '');
+                      timeUpdates[timeKey] = numVal;
+                  } else if (newStrategy[key] !== undefined) {
+                      newStrategy[key] = numVal;
+                  }
+              }
+          });
+          setIdealStrategy(newStrategy);
+          if (Object.keys(timeUpdates).length > 0) {
+            setManualNodes(prev => prev.map(n => n.id in timeUpdates ? { ...n, time: timeUpdates[n.id] } : n));
+          }
+      }
+
+      // Pulisce il testo rimuovendo i comandi tecnici invisibili
+      let cleanText = responseText
+        .replace(/\[AGGIUNGI:\s*[^\]]+\]/gi, '')
+        .replace(/\[ALLENAMENTO:\s*[^\]]+\]/gi, '')
+        .replace(/\[STRATEGIA:\s*[^\]]+\]/gi, '')
+        .trim();
+
+      if (cleanText === '') {
+        cleanText = '✨ Strategia applicata con successo.';
+      }
+
+      setChatHistory(prev => {
+        const newHist = [...prev];
+        newHist.pop(); // Rimuove il typing indicator
+        newHist.push({ sender: 'ai', text: cleanText });
+        return newHist;
+      });
+
+      if (newLogItems.length > 0) setDailyLog(prev => [...newLogItems, ...prev]);
+    } catch (e) {
+      setChatHistory(prev => { const newHist = [...prev]; newHist.pop(); newHist.push({ sender: 'ai', text: `❌ ${e.message}` }); return newHist; });
+    }
+  };
+
+  const generateFoodWithAI = async (foodName) => {
+    const name = (foodName || foodNameInput || '').trim();
+    if (!name) return;
+    if (!userUid) { alert('Effettua il login per salvare nuovi alimenti.'); return; }
+    setIsGeneratingFood(true);
+    try {
+      const prompt = `Restituisci SOLO un JSON valido, senza altro testo, con i valori nutrizionali per 100g dell'alimento "${name}".
+Chiavi obbligatorie (numeri): desc (stringa con il nome), kcal, prot, carb, fatTotal, fibre.
+Aggiungi se possibile: leu, iso, val, lys, vitA, vitc, vitD, ca, fe, mg, zn, omega3 (tutti in mg o µg come standard RDA).
+Esempio: {"desc":"${name}","kcal":120,"prot":25,"carb":0,"fatTotal":2,"fibre":0}`;
+      const raw = await callGeminiAPIWithRotation(prompt);
+      let jsonStr = raw.trim();
+      const jsonMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (jsonMatch) jsonStr = jsonMatch[1].trim();
+      const data = JSON.parse(jsonStr);
+      const desc = data.desc || name;
+      const entryPer100 = { desc };
+      ['kcal', 'cal', 'prot', 'carb', 'fatTotal', 'fibre', 'leu', 'iso', 'val', 'lys', 'vitA', 'vitc', 'vitD', 'ca', 'fe', 'mg', 'zn', 'omega3'].forEach(k => {
+        if (typeof data[k] === 'number') entryPer100[k] = data[k];
+      });
+      if (entryPer100.kcal == null) entryPer100.kcal = entryPer100.cal ?? getDefaultNutrientValue('kcal');
+      Object.keys(TARGETS).forEach(g => Object.keys(TARGETS[g]).forEach(k => {
+        if (entryPer100[k] == null) entryPer100[k] = getDefaultNutrientValue(k);
+      }));
+      const newKey = `food_${Date.now()}_${desc.replace(/\s+/g, '_').slice(0, 20)}`;
+      const basePath = `users/${userUid}/tracker_data`;
+      await set(ref(db, `${basePath}/trackerFoodDatabase/${newKey}`), entryPer100);
+      setFoodDb(prev => ({ ...prev, [newKey]: entryPer100 }));
+      const weight = parseFloat(foodWeightInput) || 100;
+      const ratio = weight / 100;
+      const newItem = {
+        id: Date.now() + Math.random(),
+        type: 'food',
+        mealType,
+        desc,
+        qta: weight,
+        weight
+      };
+      Object.keys(entryPer100).forEach(k => { if (typeof entryPer100[k] === 'number' && k !== 'id') newItem[k] = entryPer100[k] * ratio; });
+      newItem.kcal = newItem.kcal ?? newItem.cal ?? 0;
+      setAddedFoods(prev => [...prev, newItem]);
+      setFoodNameInput('');
+      setFoodWeightInput('');
+      setShowFoodDropdown(false);
+    } catch (e) {
+      alert(`Generazione alimento fallita: ${e.message}`);
+    } finally {
+      setIsGeneratingFood(false);
+    }
+  };
+
+  const waterProgress = Math.min((waterIntake / dailyWaterGoal) * 100, 100);
+  const foodsLog = dailyLog.filter(item => item.type === 'food');
+  const groupedFoods = foodsLog.reduce((acc, food) => { (acc[food.mealType] = acc[food.mealType] || []).push(food); return acc; }, {});
+  const workoutsLog = dailyLog.filter(item => item.type === 'workout');
+
+  const todayStr = getTodayString();
+
+  const selectedDayData = useMemo(() => {
+    if (!selectedHistoryDate || !fullStorico) return null;
+    const node = fullStorico[TRACKER_STORICO_KEY(selectedHistoryDate)];
+    if (!node) return null;
+    const log = node.log ?? [];
+    let calorie = 0, proteine = 0, workoutKcal = 0;
+    (log || []).forEach(entry => {
+      if (entry.type === 'meal' && entry.items) {
+        entry.items.forEach(item => { proteine += item.prot || 0; calorie += (item.cal || item.kcal) || 0; });
+      } else if (entry.type === 'single' || !entry.type) {
+        proteine += entry.prot || 0;
+        calorie += (entry.cal || entry.kcal) || 0;
+      } else if (entry.type === 'workout') {
+        workoutKcal += (entry.cal || entry.kcal) || 0;
+      }
+    });
+    const giornoSettimana = new Date(selectedHistoryDate).getDay();
+    const piano = PIANO_SETTIMANALE[giornoSettimana] ?? PIANO_SETTIMANALE[1];
+    const obiettivo = piano.cal + workoutKcal;
+    const deficit = Math.round(calorie - obiettivo);
+    return { log, calorie, proteine, workoutKcal, deficit };
+  }, [fullStorico, selectedHistoryDate]);
+
+  const pastDaysStorico = useMemo(() => {
+    if (!fullStorico || typeof fullStorico !== 'object') return [];
+    const keys = Object.keys(fullStorico).filter(k => k.startsWith('trackerStorico_'));
+    const dates = keys.map(k => k.replace('trackerStorico_', '')).filter(d => d !== todayStr);
+    dates.sort((a, b) => new Date(b) - new Date(a));
+    return dates.map(dataStr => {
+      const node = fullStorico[TRACKER_STORICO_KEY(dataStr)];
+      const log = node?.log ?? [];
+      let calorie = 0, proteine = 0, workoutKcal = 0;
+      (log || []).forEach(entry => {
+        if (entry.type === 'meal' && entry.items) {
+          entry.items.forEach(item => { proteine += item.prot || 0; calorie += (item.cal || item.kcal) || 0; });
+        } else if (entry.type === 'single' || !entry.type) {
+          proteine += entry.prot || 0;
+          calorie += (entry.cal || entry.kcal) || 0;
+        } else if (entry.type === 'workout') {
+          workoutKcal += (entry.cal || entry.kcal) || 0;
+        }
+      });
+      const giornoSettimana = new Date(dataStr).getDay();
+      const piano = PIANO_SETTIMANALE[giornoSettimana] ?? PIANO_SETTIMANALE[1];
+      const obiettivo = piano.cal + workoutKcal;
+      const deficit = Math.round(calorie - obiettivo);
+      return { dataStr, log, calorie, proteine, workoutKcal, deficit, note: node?.note };
+    });
+  }, [fullStorico, todayStr]);
+
+  const weeklyTrendData = useMemo(() => {
+    return [...pastDaysStorico].slice(0, 7).reverse().map(d => ({
+      ...d,
+      shortDate: d.dataStr.substring(5)
+    }));
+  }, [pastDaysStorico]);
+
+  const weeklyMicrosTotals = useMemo(() => {
+    const totals = { fatTotal: 0, omega3: 0, omega6: 0, vitA: 0, vitD: 0, vitE: 0, vitK: 0, vitB12: 0 };
+    const last7 = pastDaysStorico.slice(0, 7);
+    last7.forEach(day => {
+      (day.log || []).forEach(entry => {
+        const sumItem = (item) => {
+          totals.fatTotal += (Number(item.fatTotal) || 0);
+          totals.omega3 += (Number(item.omega3) || 0);
+          totals.omega6 += (Number(item.omega6) || 0);
+          totals.vitA += (Number(item.vitA) || 0);
+          totals.vitD += (Number(item.vitD) || 0);
+          totals.vitE += (Number(item.vitE) || 0);
+          totals.vitK += (Number(item.vitK) || 0);
+          totals.vitB12 += (Number(item.vitB12) || 0);
+        };
+        if (entry.type === 'meal' && entry.items) {
+          entry.items.forEach(sumItem);
+        } else if (entry.type === 'food' || entry.type === 'single' || !entry.type) {
+          sumItem(entry);
+        }
+      });
+    });
+    return totals;
+  }, [pastDaysStorico]);
+
+  const getNutrientSources = (nutrientKey, target, isWeekly = false) => {
+    const sources = {};
+    const processEntry = (entry) => {
+      const amount = Number(entry[nutrientKey]) || 0;
+      if (amount > 0) {
+        const name = (entry.desc || entry.name || 'Sconosciuto').trim();
+        sources[name] = (sources[name] || 0) + amount;
+      }
+    };
+    const logsToProcess = isWeekly
+      ? pastDaysStorico.slice(0, 7).flatMap(d => d.log || [])
+      : dailyLog;
+    logsToProcess.forEach(entry => {
+      if (entry.type === 'meal' && entry.items) {
+        entry.items.forEach(processEntry);
+      } else if (entry.type === 'food' || entry.type === 'single' || !entry.type) {
+        processEntry(entry);
+      }
+    });
+    return Object.keys(sources).map(name => {
+      const amount = sources[name];
+      const percent = target > 0 ? (amount / target) * 100 : 0;
+      return { name, amount, percent };
+    }).sort((a, b) => b.amount - a.amount);
+  };
+
+  // Renderizzatore Barre Telemetria
+  const renderProgressBar = (label, current, target, unit = 'g', nutrientKey = null) => {
+    const c = Number(current) ?? 0;
+    const t = Number(target) ?? 0;
+    const p = t > 0 ? Math.min((c / t) * 100, 100) : 0;
+    const color = p >= 100 ? '#00e676' : p > 50 ? '#00e5ff' : '#ff6d00';
+    return (
+      <div
+        style={{ marginBottom: '12px', cursor: nutrientKey ? 'pointer' : 'default', transition: 'transform 0.2s' }}
+        onClick={() => nutrientKey && setNutrientModal({ label, key: nutrientKey, target: t, unit, isWeekly: false })}
+        onMouseEnter={(e) => nutrientKey && (e.currentTarget.style.transform = 'scale(1.02)')}
+        onMouseLeave={(e) => nutrientKey && (e.currentTarget.style.transform = 'scale(1)')}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.65rem', color: '#aaa', marginBottom: '4px' }}>
+          <span>{label}</span>
+          <span>{c.toFixed(1)} / {t} {unit}</span>
+        </div>
+        <div style={{ height: '4px', background: '#222', borderRadius: '2px', overflow: 'hidden' }}>
+          <div style={{ width: `${p}%`, height: '100%', background: color, transition: 'width 0.5s' }}></div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderRatioBar = (title, labelA, valA, labelB, valB, idealText, isGood) => {
+    const vA = Number(valA) || 0;
+    const vB = Number(valB) || 0;
+    const total = vA + vB;
+    const percentA = total > 0 ? (vA / total) * 100 : 50;
+    return (
+      <div style={{ marginBottom: '20px', background: 'rgba(255,255,255,0.02)', padding: '15px', borderRadius: '12px', border: '1px solid #2a2a2a' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.65rem', color: '#aaa', marginBottom: '10px', textTransform: 'uppercase', letterSpacing: '1px' }}>
+          <span>{title}</span>
+          <span style={{ color: isGood ? '#00e676' : '#ffea00' }}>{idealText}</span>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: '6px', fontWeight: 'bold' }}>
+          <span style={{ color: '#ff6d00' }}>{labelA}: {Math.round(vA)}</span>
+          <span style={{ color: '#00e5ff' }}>{labelB}: {Math.round(vB)}</span>
+        </div>
+        <div style={{ height: '8px', background: '#00e5ff', borderRadius: '4px', overflow: 'hidden', display: 'flex', boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.5)' }}>
+          <div style={{ width: `${percentA}%`, background: '#ff6d00', transition: 'width 0.5s', borderRight: '2px solid #111' }}></div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderWeeklyBar = (label, current, dailyTarget, unit, nutrientKey = null) => {
+    const target = (Number(dailyTarget) || 1) * 7;
+    const percent = Math.min((current / target) * 100, 100);
+    const isOver = current > target * 1.5;
+    return (
+      <div
+        key={label}
+        style={{ marginBottom: '10px', cursor: nutrientKey ? 'pointer' : 'default', transition: 'transform 0.2s' }}
+        onClick={() => nutrientKey && setNutrientModal({ label, key: nutrientKey, target, unit, isWeekly: true })}
+        onMouseEnter={(e) => nutrientKey && (e.currentTarget.style.transform = 'scale(1.02)')}
+        onMouseLeave={(e) => nutrientKey && (e.currentTarget.style.transform = 'scale(1)')}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.65rem', color: '#888', marginBottom: '4px', textTransform: 'uppercase' }}>
+          <span>{label}</span>
+          <span style={{ color: isOver ? '#ff3d00' : '#ccc' }}>{Math.round(current)} / {Math.round(target)} {unit}</span>
+        </div>
+        <div style={{ height: '5px', background: '#222', borderRadius: '3px', overflow: 'hidden' }}>
+          <div style={{ width: `${percent}%`, height: '100%', background: isOver ? '#ff3d00' : (percent >= 100 ? '#00e676' : '#b388ff'), transition: 'width 0.5s' }}></div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderMiniBar = (label, current, target, color) => {
+    const percent = Math.min((current / (target || 1)) * 100, 100);
+    const isOver = current > target * 1.1;
+    return (
+      <div key={label} style={{ flex: '1 1 45%', minWidth: '120px', marginBottom: '8px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.65rem', color: '#888', marginBottom: '4px' }}>
+          <span>{label}</span>
+          <span style={{ color: isOver ? '#ff3d00' : '#ccc' }}>{Math.round(current)} / {Math.round(target)}</span>
+        </div>
+        <div style={{ height: '4px', background: '#222', borderRadius: '2px', overflow: 'hidden' }}>
+          <div style={{ width: `${percent}%`, height: '100%', background: isOver ? '#ff3d00' : color, transition: 'width 0.3s' }}></div>
+        </div>
+      </div>
+    );
+  };
+
+  // ========================================================
+  // SCHERMATA DI LOGIN
+  // ========================================================
+  if (!isAuthenticated) {
+    return (
+      <div style={{ backgroundColor: '#000', color: '#00e5ff', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'monospace', overflow: 'hidden', position: 'relative' }}>
+        <style>
+          {`
+            .login-box { background: rgba(10,10,10,0.9); border: 1px solid #333; padding: 40px; border-radius: 15px; z-index: 10; width: 90%; max-width: 400px; box-shadow: 0 0 40px rgba(0, 229, 255, 0.1); position: relative; }
+            .login-box::before { content: ''; position: absolute; top: 0; left: 50%; transform: translateX(-50%); width: 50px; height: 2px; background: #00e5ff; box-shadow: 0 0 10px #00e5ff; }
+            .sys-title { text-align: center; letter-spacing: 4px; margin-bottom: 30px; font-size: 1.2rem; }
+            .login-input { width: 100%; background: #050505; border: 1px solid #333; padding: 15px; color: #fff; font-family: monospace; margin-bottom: 15px; border-radius: 5px; outline: none; transition: 0.3s; }
+            .login-input:focus { border-color: #00e5ff; box-shadow: inset 0 0 10px rgba(0,229,255,0.1); }
+            .login-btn { width: 100%; background: transparent; border: 1px solid #00e5ff; color: #00e5ff; padding: 15px; font-family: monospace; font-weight: bold; letter-spacing: 2px; cursor: pointer; transition: 0.3s; border-radius: 5px; margin-top: 10px; }
+            .login-btn:hover { background: #00e5ff; color: #000; box-shadow: 0 0 20px rgba(0,229,255,0.4); }
+            .spinner { border: 2px solid transparent; border-top-color: #00e5ff; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin: 0 auto 20px auto; }
+            @keyframes spin { to { transform: rotate(360deg); } }
+          `}
+        </style>
+        <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, background: 'radial-gradient(circle at center, #050505 0%, #000 100%)', opacity: 0.8, pointerEvents: 'none' }}></div>
+        {isBooting ? (
+          <div className="login-box" style={{textAlign: 'center', color: '#fff', fontSize: '0.8rem', lineHeight: '1.8'}}>
+            <div className="spinner"></div>
+            <div>VERIFICA CREDENZIALI...</div>
+            <div style={{color: '#888'}}>CONNESSIONE CLOUD [OK]</div>
+            <div style={{color: '#00e676', marginTop: '10px'}}>ACCESSO CONSENTITO</div>
+          </div>
+        ) : (
+          <form className="login-box" onSubmit={handleLogin}>
+            <div className="sys-title">VYTA <span style={{color: '#444'}}>// V7</span></div>
+            <p style={{textAlign: 'center', fontSize: '0.65rem', color: '#666', marginBottom: '20px'}}>SYSTEM ENCRYPTED. REQUIRE AUTHENTICATION.</p>
+            <input type="email" placeholder="USER ID (EMAIL)" className="login-input" required value={loginEmail} onChange={e => setLoginEmail(e.target.value)} />
+            <input type="password" placeholder="PASSWORD" className="login-input" required value={loginPassword} onChange={e => setLoginPassword(e.target.value)} />
+            <button type="submit" className="login-btn">INIZIALIZZA</button>
+          </form>
+        )}
+      </div>
+    );
+  }
+
+  // ========================================================
+  // SCHERMATA PRINCIPALE VYTA (Grafica Premium + Logica Completa)
+  // ========================================================
+  const energyChartResult = generateRealEnergyData(allNodes, dailyLog || [], idealStrategy);
+  const chartData = energyChartResult?.chartData ?? [];
+  const realTotals = energyChartResult?.realTotals ?? {};
+  const currentH = Math.floor(currentTime);
+  const nextH = Math.min(24, currentH + 1);
+  const fraction = currentTime - currentH;
+  const dotY = chartData.length > 0
+    ? (chartData[currentH]?.energy ?? 0) + ((chartData[nextH]?.energy ?? 0) - (chartData[currentH]?.energy ?? 0)) * fraction
+    : 0;
+  const currentMinutes = Math.round((currentTime % 1) * 60);
+  const timeLabel = `ORA (${currentH.toString().padStart(2, '0')}:${String(currentMinutes).padStart(2, '0')})`;
+  const energyAt20 = chartData[20]?.energy;
+
+  const idealDotY = chartData.length > 0
+    ? (chartData[currentH]?.idealEnergy ?? 0) + ((chartData[nextH]?.idealEnergy ?? 0) - (chartData[currentH]?.idealEnergy ?? 0)) * fraction
+    : 0;
+
+  const renderData = [];
+  chartData.forEach((point, index) => {
+    renderData.push(point);
+    if (index === currentH && fraction > 0) {
+      renderData.push({
+        time: currentTime,
+        energy: dotY,
+        idealEnergy: idealDotY
+      });
+    }
+  });
+
+  const renderDataWithSegments = renderData.map(d => ({
+    ...d,
+    energyPast: d.time <= currentTime ? d.energy : null,
+    energyFuture: d.time >= currentTime ? d.energy : null
+  }));
+
+  const currentMealTotals = addedFoods.reduce((acc, food) => ({
+    kcal: acc.kcal + (Number(food.kcal) || Number(food.cal) || 0),
+    prot: acc.prot + (Number(food.prot) || 0),
+    carb: acc.carb + (Number(food.carb) || 0),
+    fat: acc.fat + (Number(food.fatTotal) || 0),
+    fibre: acc.fibre + (Number(food.fibre) || 0)
+  }), { kcal: 0, prot: 0, carb: 0, fat: 0, fibre: 0 });
+
+  const strategyKeyForMeal = { merenda1: 'colazione', pranzo: 'pranzo', merenda2: 'spuntino', cena: 'cena' }[mealType] || mealType;
+  const targetKcalPasto = idealStrategy[strategyKeyForMeal] || 500;
+  const targetMacrosPasto = {
+    kcal: targetKcalPasto,
+    prot: (targetKcalPasto * 0.3) / 4,
+    carb: (targetKcalPasto * 0.4) / 4,
+    fat: (targetKcalPasto * 0.3) / 9,
+    fibre: 10
+  };
+
+  return (
+    <div style={{ backgroundColor: '#000', color: '#fff', minHeight: '100vh', display: 'flex', flexDirection: 'column', padding: '20px', fontFamily: 'sans-serif', overflow: 'hidden' }}>
+      
+      <style>
+        {`
+          .future { stroke-dasharray: 4 6; animation: f-flow 2s linear infinite; opacity: 0.2; }
+          @keyframes f-flow { from { stroke-dashoffset: 20; } to { stroke-dashoffset: 0; } }
+
+          .btn-toggle { background: none; border: 1px solid #333; color: #666; padding: 8px 16px; border-radius: 20px; font-size: 0.7rem; cursor: pointer; letter-spacing: 2px; transition: all 0.3s; }
+          .btn-toggle.active { border-color: #00e5ff; color: #00e5ff; box-shadow: 0 0 10px rgba(0,229,255,0.2); }
+          
+          .drawer-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(8px); opacity: 0; pointer-events: none; transition: opacity 0.4s ease; z-index: 100; }
+          .drawer-overlay.open { opacity: 1; pointer-events: all; }
+          
+          .drawer-content { position: fixed; bottom: -100%; left: 0; right: 0; background: rgba(15, 15, 15, 0.95); border-top: 1px solid #2a2a2a; border-radius: 35px 35px 0 0; padding: 40px 25px; transition: bottom 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.05); z-index: 101; box-shadow: 0 -10px 50px rgba(0,0,0,0.9); max-height: 88vh; overflow-y: auto; backdrop-filter: blur(25px); }
+          .drawer-content.open { bottom: 0; }
+          
+          @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+          .view-animate { animation: fadeIn 0.3s ease forwards; }
+
+          .action-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+          .action-btn { background: rgba(255,255,255,0.04); border: 1px solid #2a2a2a; color: #fff; padding: 15px; border-radius: 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; cursor: pointer; transition: 0.2s; }
+          .action-btn:active { transform: scale(0.95); border-color: #555; background: rgba(255,255,255,0.08); }
+          .action-btn.full-width { grid-column: 1 / -1; flex-direction: row; padding: 20px; gap: 15px; }
+          .action-btn.full-width .action-icon { font-size: 2rem; }
+          .action-icon { font-size: 1.6rem; filter: drop-shadow(0 0 5px rgba(255,255,255,0.1)); }
+          .action-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 1.5px; color: #aaa; font-weight: 600; }
+
+          .type-btn { flex: 1; background: transparent; border: 1px solid #333; color: #777; padding: 12px 0; border-radius: 14px; font-size: 0.7rem; letter-spacing: 1px; cursor: pointer; transition: 0.3s; text-align: center; }
+          .type-btn.active { background: #fff; color: #000; border-color: #fff; font-weight: bold; box-shadow: 0 0 15px rgba(255,255,255,0.2); }
+          .type-btn.active.orange { background: #ff6d00; color: #000; border-color: #ff6d00; box-shadow: 0 0 15px rgba(255, 109, 0, 0.4); }
+          .type-btn.active.blue { background: #00e5ff; color: #000; border-color: #00e5ff; box-shadow: 0 0 15px rgba(0, 229, 255, 0.4); }
+
+          .burn-slider-container { background: #111; padding: 30px 20px; border-radius: 20px; border: 1px solid #222; text-align: center; margin-bottom: 20px; position: relative; overflow: hidden; }
+          .burn-value { font-size: 3.5rem; font-weight: bold; color: #fff; line-height: 1; margin-bottom: 5px; }
+          .burn-value.tuning { color: #00e5ff; text-shadow: 0 0 20px rgba(0,229,255,0.3); }
+          .burn-value.workout { color: #ff6d00; text-shadow: 0 0 20px rgba(255,109,0,0.3); }
+          .burn-label { font-size: 0.75rem; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 25px; display: block; }
+          .custom-range { -webkit-appearance: none; width: 100%; height: 8px; border-radius: 4px; background: #2a2a2a; outline: none; position: relative; z-index: 2; }
+          .custom-range.orange::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 26px; height: 26px; border-radius: 50%; background: #ff6d00; cursor: pointer; box-shadow: 0 0 15px #ff6d00, inset 0 0 5px rgba(255,255,255,0.8); border: 2px solid #fff; }
+          .custom-range.blue::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 26px; height: 26px; border-radius: 50%; background: #00e5ff; cursor: pointer; box-shadow: 0 0 15px #00e5ff, inset 0 0 5px rgba(255,255,255,0.8); border: 2px solid #fff; }
+
+          .food-pill { display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.5); border: 1px solid #2a2a2a; padding: 12px 15px; border-radius: 14px; margin-bottom: 8px; animation: fadeIn 0.2s ease; }
+          .food-pill-name { font-size: 0.85rem; font-weight: 500; color: #eee; }
+          .food-pill-weight { font-size: 0.75rem; color: #00e5ff; margin-left: 10px; font-weight: bold; }
+          .food-pill-actions { display: flex; gap: 10px; align-items: center; }
+          .food-pill-btn { background: none; border: none; cursor: pointer; font-size: 1rem; opacity: 0.6; transition: 0.2s; padding: 0; }
+          .food-pill-btn:hover { opacity: 1; }
+          .btn-info { color: #fff; } .btn-delete { color: #ff4d4d; }
+          .quick-add-bar { display: flex; background: rgba(255,255,255,0.05); border-radius: 18px; border: 1px solid #333; overflow: hidden; margin-bottom: 20px; transition: border-color 0.3s; }
+          .quick-add-bar:focus-within { border-color: #00e5ff; box-shadow: 0 0 15px rgba(0, 229, 255, 0.1); }
+          .quick-input { background: transparent; border: none; color: #fff; padding: 16px; font-size: 0.9rem; outline: none; }
+          .input-name { flex: 2; border-right: 1px solid #333; }
+          .input-weight { flex: 1; text-align: center; }
+          .quick-add-btn { background: #00e5ff; color: #000; border: none; padding: 0 20px; font-weight: bold; font-size: 1.2rem; cursor: pointer; transition: 0.2s; }
+          
+          .diary-group-title { font-size: 0.7rem; color: #666; text-transform: uppercase; letter-spacing: 2px; margin: 20px 0 10px 10px; border-left: 2px solid #00e5ff; padding-left: 10px; }
+          
+          .water-fill-container { height: 12px; background: #222; border-radius: 6px; overflow: hidden; margin: 20px 0 40px 0; position: relative; box-shadow: inset 0 2px 5px rgba(0,0,0,0.5); }
+          .water-fill-bar { height: 100%; background: linear-gradient(90deg, #007aff, #00e5ff); border-radius: 6px; transition: width 0.8s cubic-bezier(0.2, 0.8, 0.2, 1); box-shadow: 0 0 15px rgba(0, 229, 255, 0.6); position: relative; }
+          .water-quick-btn { background: rgba(0, 229, 255, 0.05); border: 1px solid rgba(0, 229, 255, 0.2); color: #00e5ff; padding: 25px 0; border-radius: 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; cursor: pointer; transition: 0.2s; flex: 1; }
+          .water-rectify-btn { background: transparent; border: 1px solid #333; color: #888; border-radius: 12px; padding: 8px 15px; font-size: 0.75rem; cursor: pointer; transition: 0.2s; }
+          
+          .chat-container { display: flex; flex-direction: column; height: 380px; }
+          .chat-messages { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; padding-right: 5px; padding-bottom: 20px; }
+          .chat-bubble { max-width: 82%; padding: 14px 18px; border-radius: 20px; font-size: 0.9rem; line-height: 1.4; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+          .bubble-ai { background: #1f1f1f; border: 1px solid #333; color: #eee; border-bottom-left-radius: 4px; align-self: flex-start; }
+          .bubble-user { background: linear-gradient(135deg, #00e5ff, #007aff); color: #000; font-weight: 500; border-bottom-right-radius: 4px; align-self: flex-end; }
+          .typing-indicator { display: flex; gap: 4px; padding: 5px; }
+          .dot { width: 6px; height: 6px; background: #888; border-radius: 50%; animation: bounce 1.4s infinite ease-in-out both; }
+          .dot:nth-child(1) { animation-delay: -0.32s; } .dot:nth-child(2) { animation-delay: -0.16s; }
+          @keyframes bounce { 0%, 80%, 100% { transform: scale(0); } 40% { transform: scale(1); background: #fff; } }
+          .chat-input-wrapper { display: flex; align-items: center; gap: 10px; background: #1a1a1a; border-radius: 30px; padding: 6px 6px 6px 20px; border: 1px solid #333; margin-top: 10px; }
+          .chat-input { flex: 1; background: transparent; border: none; color: #fff; font-size: 0.95rem; outline: none; }
+          .chat-send-btn { background: #fff; color: #000; border: none; width: 40px; height: 40px; border-radius: 50%; display: flex; justify-content: center; align-items: center; cursor: pointer; transition: 0.2s; font-size: 1.1rem; }
+          .chat-send-btn.has-text { background: #b388ff; color: #fff; }
+
+          .zen-container { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 250px; position: relative; margin-bottom: 20px; }
+          .zen-orb { width: 80px; height: 80px; border-radius: 50%; background: radial-gradient(circle, #fbc02d 10%, #f57f17 100%); opacity: 0.2; box-shadow: 0 0 20px rgba(251, 192, 45, 0.2); transition: all 0.5s ease; position: relative; z-index: 2; }
+          .zen-orb.breathing { animation: boxBreathe 16s linear infinite; }
+          @keyframes boxBreathe { 0% { transform: scale(1); opacity: 0.3; box-shadow: 0 0 20px rgba(251, 192, 45, 0.2); } 25% { transform: scale(2.2); opacity: 1; box-shadow: 0 0 80px rgba(251, 192, 45, 0.8); } 50% { transform: scale(2.2); opacity: 1; box-shadow: 0 0 80px rgba(251, 192, 45, 0.8); } 75% { transform: scale(1); opacity: 0.3; box-shadow: 0 0 20px rgba(251, 192, 45, 0.2); } 100% { transform: scale(1); opacity: 0.3; box-shadow: 0 0 20px rgba(251, 192, 45, 0.2); } }
+          .zen-rings { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 80px; height: 80px; border-radius: 50%; border: 1px solid rgba(251, 192, 45, 0.3); z-index: 1; transition: all 0.5s ease; }
+          .breathing ~ .zen-rings { animation: ringsExpand 16s linear infinite; }
+          @keyframes ringsExpand { 0% { transform: translate(-50%, -50%) scale(1); opacity: 0; } 12% { opacity: 1; } 25% { transform: translate(-50%, -50%) scale(2.6); opacity: 0; } 100% { transform: translate(-50%, -50%) scale(2.6); opacity: 0; } }
+          .zen-instruction { position: absolute; bottom: 0; font-size: 0.8rem; color: #888; letter-spacing: 2px; text-transform: uppercase; animation: fadeInOut 16s linear infinite; opacity: 0; }
+          .breathing ~ .zen-instruction { opacity: 1; }
+          @keyframes fadeInOut { 0%, 24% { content: "Inspira"; color: #fbc02d; } 25%, 49% { content: "Trattieni"; color: #fff; } 50%, 74% { content: "Espira"; color: #fbc02d; } 75%, 100% { content: "Pausa"; color: #888; } }
+        `}
+      </style>
+
+      {/* HEADER E GRAFICO */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '40px' }}>
+        <h1 style={{ fontSize: '1rem', letterSpacing: '4px', margin: 0 }}>VYTA <span style={{color: '#444'}}>SYS</span></h1>
+        <div style={{ display: 'flex', gap: '10px' }}>
+          <button className={`btn-toggle ${showDetails ? 'active' : ''}`} onClick={() => setShowDetails(!showDetails)}>HUD: {showDetails ? 'ON' : 'OFF'}</button>
+          <button className="btn-toggle" onClick={() => { auth.signOut(); }}>LOGOUT</button>
+        </div>
+      </div>
+
+      {/* Cruscotto energetico giornaliero 0-24h */}
+      <div style={{ marginBottom: '24px', background: '#0a0a0a', border: '1px solid #1a1a1a', borderRadius: '16px', padding: '16px', boxShadow: '0 4px 20px rgba(0,0,0,0.3)' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+          <span style={{ fontSize: '0.7rem', color: '#666', letterSpacing: '2px', textTransform: 'uppercase' }}>Energia 0–24h</span>
+          <button type="button" onClick={() => setIsGraphUnlocked(u => !u)} style={{ background: 'none', border: 'none', fontSize: '1.2rem', cursor: 'pointer', padding: '4px 8px', color: isGraphUnlocked ? '#ff6d00' : '#555' }} title={isGraphUnlocked ? 'Blocca timeline' : 'Sblocca e trascina i nodi'}>
+            {isGraphUnlocked ? '🔓' : '🔒'}
+          </button>
+        </div>
+        <div style={{ position: 'relative' }}>
+          <ResponsiveContainer width="100%" height={250}>
+            <ComposedChart data={renderDataWithSegments} margin={{ top: 35, right: 20, left: 0, bottom: 0 }}>
+              <defs>
+                <linearGradient id="colorEnergy" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#00b4d8" stopOpacity={0.9} />
+                  <stop offset="50%" stopColor="#047857" stopOpacity={0.7} />
+                  <stop offset="100%" stopColor="#dc2626" stopOpacity={0.6} />
+                </linearGradient>
+                <linearGradient id="vitalFlow" x1="0" y1="0" x2="1" y2="0">
+                  <stop offset="0%" stopColor="#00e5ff" stopOpacity={0.8}>
+                    <animate attributeName="offset" values="-1;1" dur="3s" repeatCount="indefinite" />
+                  </stop>
+                  <stop offset="50%" stopColor="#b388ff" stopOpacity={1}>
+                    <animate attributeName="offset" values="0;2" dur="3s" repeatCount="indefinite" />
+                  </stop>
+                  <stop offset="100%" stopColor="#00e5ff" stopOpacity={0.8}>
+                    <animate attributeName="offset" values="1;3" dur="3s" repeatCount="indefinite" />
+                  </stop>
+                </linearGradient>
+                <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+                  <feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur" />
+                  <feMerge>
+                    <feMergeNode in="blur" />
+                    <feMergeNode in="SourceGraphic" />
+                  </feMerge>
+                </filter>
+              </defs>
+              <XAxis dataKey="time" type="number" domain={[0, 24]} tickCount={13} tickFormatter={(val) => `${Math.floor(val)}:00`} axisLine={false} tickLine={false} tick={{ fill: '#666', fontSize: 10 }} />
+              <YAxis domain={[0, 100]} tick={{ fill: '#555', fontSize: 10 }} axisLine={false} tickLine={false} width={28} />
+              <CartesianGrid strokeDasharray="3 3" stroke="#1a1a1a" vertical={false} />
+              <Tooltip labelFormatter={(label) => `${Math.floor(Number(label))}:00`} contentStyle={{ backgroundColor: '#111', border: '1px solid #333', borderRadius: '8px', fontSize: '0.8rem' }} />
+              <Area type="monotone" dataKey="energyPast" stroke="url(#vitalFlow)" strokeWidth={3} fill="url(#colorEnergy)" filter="url(#glow)" isAnimationActive={!draggingNode} animationDuration={600} animationEasing="ease-in-out" connectNulls={false} />
+              <Area type="monotone" dataKey="energyFuture" stroke="#333" strokeWidth={2} strokeDasharray="5 5" fill="transparent" isAnimationActive={!draggingNode} animationDuration={600} animationEasing="ease-in-out" connectNulls={false} />
+              <Line type="monotone" dataKey="idealEnergy" stroke="rgba(255, 255, 255, 0.6)" strokeWidth={2} strokeDasharray="5 5" dot={false} isAnimationActive={!draggingNode} animationDuration={600} animationEasing="ease-in-out" />
+              <ReferenceLine x={currentTime} stroke="rgba(255,255,255,0.3)" strokeDasharray="3 3" isFront label={{ position: 'top', value: timeLabel, fill: '#aaa', fontSize: 11, offset: 10 }} />
+              <ReferenceDot x={currentTime} y={dotY} isFront shape={(props) => {
+                const cx = props?.cx;
+                const cy = props?.cy;
+                if (cx == null || cy == null || typeof cx !== 'number' || typeof cy !== 'number') return <path d="M0 0" />;
+                return (
+                  <g>
+                    <circle cx={cx} cy={cy} r={5} fill="#00e5ff" />
+                    <circle cx={cx} cy={cy} r={5} fill="none" stroke="#00e5ff" strokeWidth={2}>
+                      <animate attributeName="r" values="5;18" dur="1.2s" repeatCount="indefinite" />
+                      <animate attributeName="opacity" values="0.9;0" dur="1.2s" repeatCount="indefinite" />
+                    </circle>
+                    <circle cx={cx} cy={cy} r={8} fill="none" stroke="#b388ff" strokeWidth={1.5} opacity={0.7}>
+                      <animate attributeName="r" values="8;24" dur="2s" repeatCount="indefinite" />
+                      <animate attributeName="opacity" values="0.7;0" dur="2s" repeatCount="indefinite" />
+                    </circle>
+                  </g>
+                );
+              }} />
+            </ComposedChart>
+          </ResponsiveContainer>
+              <div ref={timelineContainerRef} style={{ position: 'relative', height: '44px', marginTop: '8px', background: 'rgba(255,255,255,0.03)', borderRadius: '8px', border: '1px solid #222' }}>
+                  {allNodes.map((node) => {
+                    const isWork = node.type === 'work';
+                    const startPercent = (node.time / 24) * 100;
+                    const durationPercent = isWork ? ((node.duration || 1) / 24) * 100 : 0;
+                    const idealVal = node.type === 'meal' ? (idealStrategy[node.id] ?? 400) : (node.type === 'workout' ? (idealStrategy.allenamento ?? 300) : (node.kcal ?? 400));
+                    const realVal = (node.type === 'meal' || node.type === 'workout') ? (realTotals[node.id] ?? 0) : 0;
+                    const ratio = idealVal > 0 ? realVal / idealVal : 1;
+                    let borderColor = '#00e5ff';
+                    if (ratio < 0.5) borderColor = '#ff3d00';
+                    else if (ratio > 1.2) borderColor = '#ffea00';
+                    const pointBorderColor = isWork ? '#ffea00' : borderColor;
+
+                    if (isWork) {
+                      return (
+                        <div key={node.id} onClick={() => handleNodeClick(node)} style={{ position: 'absolute', left: `${startPercent}%`, width: `${durationPercent}%`, top: '50%', marginTop: '-18px', height: '36px', background: 'rgba(255, 234, 0, 0.15)', borderLeft: '2px solid #ffea00', borderRight: '2px solid #ffea00', borderRadius: '4px', cursor: isGraphUnlocked ? 'default' : 'pointer', zIndex: 5 }}>
+                          <div onPointerDown={(e) => { if (isGraphUnlocked) { e.preventDefault(); e.stopPropagation(); setDraggingNode({ id: node.id, edge: 'start' }); } }} style={{ position: 'absolute', left: '-18px', width: '36px', height: '36px', borderRadius: '50%', background: 'rgba(0,0,0,0.8)', border: '2px solid #ffea00', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: isGraphUnlocked ? 'ew-resize' : 'pointer' }}>💼</div>
+                          <div onPointerDown={(e) => { if (isGraphUnlocked) { e.preventDefault(); e.stopPropagation(); setDraggingNode({ id: node.id, edge: 'end' }); } }} style={{ position: 'absolute', right: '-18px', width: '36px', height: '36px', borderRadius: '50%', background: 'rgba(0,0,0,0.8)', border: '2px solid #ffea00', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: isGraphUnlocked ? 'ew-resize' : 'pointer' }}>🏁</div>
+                          {isGraphUnlocked && <button type="button" onClick={(e) => { e.stopPropagation(); node.type === 'meal' ? setDailyLog(prev => prev.filter(item => !(item.type === 'food' && item.mealType === node.id))) : setManualNodes(prev => prev.filter(n => n.id !== node.id)); }} style={{ position: 'absolute', top: '-25px', left: '50%', transform: 'translateX(-50%)', background: '#ff3d00', color: '#fff', border: 'none', borderRadius: '50%', width: '20px', height: '20px', fontSize: '0.6rem', cursor: 'pointer' }}>✕</button>}
+                        </div>
+                      );
+                    }
+
+                    return (
+                      <div key={node.id} onClick={() => handleNodeClick(node)} onPointerDown={(e) => { if (isGraphUnlocked) { e.preventDefault(); e.stopPropagation(); setDraggingNode({ id: node.id, edge: 'all' }); } }} style={{ position: 'absolute', left: `${startPercent}%`, transform: 'translateX(-50%)', top: '50%', marginTop: '-18px', width: '36px', height: '36px', borderRadius: '50%', background: draggingNode?.id === node.id ? 'rgba(0,229,255,0.25)' : 'rgba(0,0,0,0.6)', border: `2px solid ${pointBorderColor}`, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', cursor: isGraphUnlocked ? 'grab' : 'pointer', zIndex: 10 }}>
+                        <span style={{ lineHeight: 1 }}>{node.icon || '•'}</span>
+                        <span style={{ fontSize: '0.55rem', color: pointBorderColor, marginTop: '1px' }}>{Math.floor(node.time)}:{String(Math.round((node.time % 1) * 60)).padStart(2, '0')}</span>
+                        {isGraphUnlocked && <button type="button" onClick={(e) => { e.stopPropagation(); node.type === 'meal' ? setDailyLog(prev => prev.filter(item => !(item.type === 'food' && item.mealType === node.id))) : setManualNodes(prev => prev.filter(n => n.id !== node.id)); }} style={{ position: 'absolute', top: '-25px', background: '#ff3d00', color: '#fff', border: 'none', borderRadius: '50%', width: '20px', height: '20px', fontSize: '0.6rem', cursor: 'pointer' }}>✕</button>}
+                      </div>
+                    );
+                  })}
+                  {isGraphUnlocked && <button type="button" onClick={(e) => { e.stopPropagation(); setNodeForm({ id: null, type: 'meal', start: 12, end: 16, kcal: 400 }); setShowNodeModal(true); }} style={{ position: 'absolute', top: '4px', right: '8px', width: '28px', height: '28px', borderRadius: '50%', background: 'rgba(0,229,255,0.2)', border: '1px solid #00e5ff', color: '#00e5ff', fontSize: '1rem', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 5 }} title="Aggiungi nodo">+</button>}
+                </div>
+            </div>
+            <div style={{ display: 'flex', gap: '10px', marginTop: '15px', padding: '10px', flexWrap: 'wrap' }}>
+              {(Number(totali?.omega3) ?? 0) < 1 ? (
+                <span style={{ background: '#440000', color: '#ff5555', borderRadius: 20, padding: '5px 10px', fontSize: '0.8rem' }}>🔴 Carenza Omega3</span>
+              ) : (
+                <span style={{ background: '#003300', color: '#55ff55', borderRadius: 20, padding: '5px 10px', fontSize: '0.8rem' }}>🟢 Micro OK</span>
+              )}
+              {(energyAt20 ?? 100) < 40 ? (
+                <span style={{ background: '#440000', color: '#ff5555', borderRadius: 20, padding: '5px 10px', fontSize: '0.8rem' }}>🚨 Rischio Cortisolo (Cena)</span>
+              ) : (
+                <span style={{ background: '#003300', color: '#55ff55', borderRadius: 20, padding: '5px 10px', fontSize: '0.8rem' }}>🟢 Livelli Serali OK</span>
+              )}
+            </div>
+        </div>
+      <div style={{ textAlign: 'center', marginTop: '24px' }}>
+        <button onClick={openDrawer} style={{ width: '65px', height: '65px', borderRadius: '50%', backgroundColor: '#fff', border: 'none', color: '#000', fontSize: '28px', cursor: 'pointer', boxShadow: '0 0 20px rgba(255,255,255,0.2)', transition: 'transform 0.1s' }} onMouseDown={(e) => e.currentTarget.style.transform = 'scale(0.9)'} onMouseUp={(e) => e.currentTarget.style.transform = 'scale(1)'}>+</button>
+      </div>
+
+      {/* --- CASSETTO AZIONI --- */}
+      <div className={`drawer-overlay ${isDrawerOpen ? 'open' : ''}`} onClick={closeDrawer}></div>
+      
+      <div className={`drawer-content ${isDrawerOpen ? 'open' : ''}`}>
+        <div style={{ width: '40px', height: '4px', backgroundColor: '#444', borderRadius: '2px', margin: '0 auto 20px auto' }}></div>
+        
+        {/* VISTA MENU PRINCIPALE (7 Tasti Reali) */}
+        {!activeAction && (
+          <div className="view-animate">
+            <h2 style={{ fontSize: '0.7rem', textAlign: 'center', color: '#777', letterSpacing: '3px', marginBottom: '25px', fontWeight: 'normal' }}>MENU SISTEMA</h2>
+            <div className="action-grid">
+              <button className="action-btn" onClick={() => { const t = getDefaultMealTime(mealType); setDrawerMealTime(t); setDrawerMealTimeStr(decimalToTimeStr(t)); setActiveAction('pasto'); setIsDrawerOpen(true); }}><span className="action-icon">🍽️</span><span className="action-label">Pasto</span></button>
+              <button className="action-btn" onClick={() => setActiveAction('acqua')}><span className="action-icon" style={{ filter: 'drop-shadow(0 0 8px rgba(0, 229, 255, 0.4))' }}>💧</span><span className="action-label" style={{ color: '#00e5ff' }}>Acqua</span></button>
+              <button className="action-btn" onClick={() => setActiveAction('allenamento')}><span className="action-icon" style={{ filter: 'drop-shadow(0 0 8px rgba(255, 109, 0, 0.4))' }}>⚡</span><span className="action-label" style={{ color: '#ff6d00' }}>Attività</span></button>
+              <button className="action-btn" onClick={() => setActiveAction('diario_giornaliero')}><span className="action-icon" style={{ filter: 'drop-shadow(0 0 8px rgba(0, 230, 118, 0.4))' }}>📓</span><span className="action-label" style={{ color: '#00e676' }}>Diario Giornaliero</span></button>
+              <button className="action-btn" onClick={() => setActiveAction('storico')}><span className="action-icon" style={{ filter: 'drop-shadow(0 0 8px rgba(176, 190, 197, 0.5))' }}>📚</span><span className="action-label" style={{ color: '#b0bec5' }}>Archivio Storico</span></button>
+              <button className="action-btn" onClick={() => setActiveAction('strategia')}><span className="action-icon" style={{ filter: 'drop-shadow(0 0 8px rgba(0, 229, 255, 0.4))' }}>🎯</span><span className="action-label" style={{ color: '#00e5ff' }}>Protocollo</span></button>
+              <button className="action-btn" onClick={() => setActiveAction('focus')}><span className="action-icon" style={{ filter: 'drop-shadow(0 0 8px rgba(251, 192, 45, 0.4))' }}>🧘</span><span className="action-label" style={{ color: '#fbc02d' }}>Neural Reset</span></button>
+              <button className="action-btn full-width" onClick={() => setActiveAction('ai_chat')} style={{ background: 'linear-gradient(145deg, rgba(26, 26, 36, 0.9), rgba(18, 16, 28, 0.9))', borderColor: '#3a2a4a' }}>
+                <span className="action-icon" style={{ filter: 'drop-shadow(0 0 10px rgba(179, 136, 255, 0.5))' }}>✨</span><span className="action-label" style={{ color: '#b388ff' }}>Assistente AI</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* VISTA STRATEGIA */}
+        {activeAction === 'strategia' && (
+          <div className="view-animate">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '25px' }}>
+              <button onClick={() => setActiveAction(null)} style={{ background: 'none', border: 'none', color: '#666', fontSize: '0.8rem', cursor: 'pointer', letterSpacing: '1px' }}>&lt; MENU</button>
+              <h2 style={{ fontSize: '0.8rem', color: '#00e5ff', letterSpacing: '2px', margin: 0 }}>🎯 PROTOCOLLO</h2>
+              <div style={{ width: '60px' }}></div>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '25px' }}>
+              {Object.keys(STRATEGY_PROFILES).map(key => (
+                <button key={key} className={`type-btn ${dayProfile === key ? 'active blue' : ''}`} onClick={() => setDayProfile(key)}>
+                  {STRATEGY_PROFILES[key].label}
+                </button>
+              ))}
+            </div>
+            <div className="burn-slider-container">
+              <span className="burn-label" style={{color: '#00e5ff'}}>TUNING CALORICO (OVERRIDE)</span>
+              <div className="burn-value tuning">{calorieTuning > 0 ? `+${calorieTuning}` : calorieTuning}</div>
+              <input type="range" min="-500" max="500" step="50" value={calorieTuning} onChange={(e) => setCalorieTuning(Number(e.target.value))} className="custom-range blue" style={{ marginTop: '20px' }} />
+            </div>
+            <button onClick={() => closeDrawer()} style={{ width: '100%', padding: '18px', backgroundColor: '#00e5ff', color: '#000', border: 'none', borderRadius: '15px', fontSize: '0.9rem', fontWeight: 'bold', letterSpacing: '2px', cursor: 'pointer', transition: '0.2s', boxShadow: '0 0 20px rgba(0, 229, 255, 0.4)' }}>SYNC STRATEGIA</button>
+          </div>
+        )}
+
+        {/* VISTA CHAT AI (CON CLUSTER CHIAVI) */}
+        {activeAction === 'ai_chat' && (
+          <div className="view-animate" style={{ display: 'flex', flexDirection: 'column' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
+              <button onClick={() => setActiveAction(null)} style={{ background: 'none', border: 'none', color: '#888', fontSize: '0.8rem', cursor: 'pointer', letterSpacing: '1px' }}>&lt; MENU</button>
+              <h2 style={{ fontSize: '0.8rem', color: '#b388ff', letterSpacing: '2px', margin: 0 }}>✨ ASSISTENTE AI</h2>
+              <button onClick={() => setShowAiSettings(!showAiSettings)} style={{ background: 'none', border: 'none', color: '#b388ff', fontSize: '1.2rem', cursor: 'pointer', filter: 'drop-shadow(0 0 5px rgba(179, 136, 255, 0.5))' }}>⚙️</button>
+            </div>
+
+            {showAiSettings && (
+              <div style={{ background: '#111', padding: '20px', borderRadius: '15px', marginBottom: '15px', border: '1px solid #333' }}>
+                <h4 style={{ fontSize: '0.7rem', color: '#b388ff', margin: '0 0 10px 0', letterSpacing: '1px' }}>CLUSTER NODI API (FALLBACK)</h4>
+                {apiKeys.map((key, idx) => (
+                  <div key={idx} className="api-key-row">
+                    <span style={{color: '#555', fontSize: '0.7rem'}}>N.{idx+1}</span>
+                    <input type="password" value={key} onChange={(e) => handleKeyChange(idx, e.target.value)} className="api-key-input" placeholder="Incolla chiave Gemini..." />
+                    <button onClick={() => handleRemoveKey(idx)} style={{ background: 'none', border: 'none', color: '#ff4d4d', cursor: 'pointer', padding: '5px' }}>✕</button>
+                  </div>
+                ))}
+                <div style={{ display: 'flex', gap: '10px', marginTop: '10px' }}>
+                  <button onClick={handleAddKey} style={{ flex: 1, padding: '10px', background: 'transparent', border: '1px dashed #333', color: '#aaa', borderRadius: '8px', cursor: 'pointer' }}>+ Aggiungi Nodo</button>
+                  <button onClick={saveApiCluster} style={{ flex: 1, padding: '10px', background: '#b388ff', border: 'none', color: '#000', borderRadius: '8px', fontWeight: 'bold', cursor: 'pointer' }}>Salva Rete</button>
+                </div>
+              </div>
+            )}
+
+            <div className="chat-container">
+              <div className="chat-messages">
+                {chatHistory.map((msg, idx) => (
+                  <div key={idx} className={`chat-bubble ${msg.sender === 'ai' ? 'bubble-ai' : 'bubble-user'}`}>
+                    {msg.isTyping ? (<div className="typing-indicator"><div className="dot"></div><div className="dot"></div><div className="dot"></div></div>) : (msg.text)}
+                  </div>
+                ))}
+                <div ref={chatEndRef} />
+              </div>
+              <div className="chat-input-wrapper">
+                <input type="text" className="chat-input" placeholder="Es: Ho mangiato 200g pollo..." value={chatInput} onChange={(e) => setChatInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleChatSubmit()} autoFocus />
+                <button className={`chat-send-btn ${chatInput.trim() ? 'has-text' : ''}`} onClick={handleChatSubmit}>↑</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* VISTA ACQUA */}
+        {activeAction === 'acqua' && (
+          <div className="view-animate">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
+              <button onClick={() => setActiveAction(null)} style={{ background: 'none', border: 'none', color: '#666', fontSize: '0.8rem', cursor: 'pointer', letterSpacing: '1px' }}>&lt; INDIETRO</button>
+              <h2 style={{ fontSize: '0.8rem', color: '#00e5ff', letterSpacing: '2px', margin: 0 }}>💧 IDRATAZIONE</h2>
+              <div style={{ width: '70px' }}></div>
+            </div>
+            <div style={{ textAlign: 'center', marginTop: '10px' }}>
+              <h3 style={{ fontSize: '3rem', margin: '0', color: '#fff', fontWeight: 'bold' }}>{waterIntake} <span style={{ fontSize: '1rem', color: '#666', fontWeight: 'normal' }}>/ {dailyWaterGoal} ml</span></h3>
+              <div className="water-fill-container"><div className="water-fill-bar" style={{ width: `${waterProgress}%` }}></div></div>
+            </div>
+            <div style={{ display: 'flex', gap: '15px' }}>
+              <button onClick={() => handleAddWater(250)} className="water-quick-btn"><span style={{ fontSize: '1.8rem', marginBottom: '5px' }}>🥛</span><span style={{ fontSize: '0.85rem', fontWeight: 'bold' }}>+ 250ml</span></button>
+              <button onClick={() => handleAddWater(500)} className="water-quick-btn"><span style={{ fontSize: '1.8rem', marginBottom: '5px' }}>🚰</span><span style={{ fontSize: '0.85rem', fontWeight: 'bold' }}>+ 500ml</span></button>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'center', gap: '10px', marginTop: '20px' }}>
+              <button onClick={() => handleAddWater(-250)} className="water-rectify-btn">- 250</button>
+              <button onClick={() => handleAddWater(-500)} className="water-rectify-btn">- 500</button>
+              <button onClick={() => setWaterIntake(0)} className="water-rectify-btn" style={{ borderColor: 'rgba(255, 77, 77, 0.4)', color: '#ff4d4d' }}>Azzera</button>
+            </div>
+          </div>
+        )}
+        
+        {/* VISTA ALLENAMENTO */}
+        {activeAction === 'allenamento' && (
+          <div className="view-animate">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '25px' }}>
+              <button onClick={() => setActiveAction(null)} style={{ background: 'none', border: 'none', color: '#666', fontSize: '0.8rem', cursor: 'pointer', letterSpacing: '1px' }}>&lt; INDIETRO</button>
+              <h2 style={{ fontSize: '0.8rem', color: '#ff6d00', letterSpacing: '2px', margin: 0 }}>⚡ ATTIVITÀ</h2>
+              <div style={{ width: '70px' }}></div>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '30px' }}>
+              {['pesi', 'cardio', 'hiit', 'lavoro'].map(type => (
+                <button key={type} className={`type-btn ${workoutType === type ? 'active orange' : ''}`} onClick={() => setWorkoutType(type)}>
+                  {type === 'pesi' ? '🏋️ PESI' : type === 'cardio' ? '🏃 CARDIO' : type === 'hiit' ? '🔥 HIIT' : '💼 LAVORO'}
+                </button>
+              ))}
+            </div>
+            <div className="burn-slider-container">
+              <span className="burn-label" style={{color: '#ff6d00'}}>OUTPUT ENERGETICO STIMATO</span>
+              <div className="burn-value workout">{workoutKcal}</div>
+              <input type="range" min="50" max="1500" step="10" value={workoutKcal} onChange={(e) => setWorkoutKcal(Number(e.target.value))} className="custom-range orange" style={{ marginTop: '20px' }} />
+            </div>
+            <button onClick={handleSaveWorkout} style={{ width: '100%', padding: '18px', backgroundColor: '#ff6d00', color: '#000', border: 'none', borderRadius: '15px', fontSize: '0.9rem', fontWeight: 'bold', letterSpacing: '2px', cursor: 'pointer', transition: '0.2s', boxShadow: '0 0 20px rgba(255, 109, 0, 0.4)' }}>REGISTRA OUTPUT</button>
+            <div style={{ marginTop: '30px' }}>
+              {workoutsLog.length > 0 && <h4 style={{ fontSize: '0.65rem', color: '#666', letterSpacing: '2px', marginBottom: '10px' }}>OUTPUT REGISTRATI OGGI</h4>}
+              {workoutsLog.map(wk => (
+                <div key={wk.id} className="food-pill" style={{ borderLeft: '3px solid #ff6d00' }}>
+                  <div><span className="food-pill-name">{wk.desc || wk.name}</span><span className="food-pill-weight" style={{color: '#ff6d00'}}>{Math.round(wk.kcal)} kcal</span></div>
+                  <div className="food-pill-actions"><button className="food-pill-btn btn-delete" onClick={() => removeLogItem(wk.id)}>✕</button></div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* VISTA PASTO RAPIDO */}
+        {activeAction === 'pasto' && (
+          <div className="view-animate">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '25px' }}>
+              <button onClick={() => setActiveAction(null)} style={{ background: 'none', border: 'none', color: '#666', fontSize: '0.8rem', cursor: 'pointer', letterSpacing: '1px' }}>&lt; INDIETRO</button>
+              <h2 style={{ fontSize: '0.8rem', color: '#fff', letterSpacing: '2px', margin: 0 }}>NUOVO PASTO</h2>
+              <div style={{ width: '70px' }}></div>
+            </div>
+            <div style={{ display: 'flex', gap: '10px', marginBottom: '15px', overflowX: 'auto', paddingBottom: '5px' }}>
+              {[{ label: 'Colazione', id: 'colazione' }, { label: 'Snack', id: 'spuntino' }, { label: 'Pranzo', id: 'pranzo' }, { label: 'Cena', id: 'cena' }].map(({ label, id }) => (
+                  <button
+                    key={id}
+                    className={`type-btn ${mealType === id ? 'active' : ''}`}
+                    onClick={() => {
+                      setMealType(id);
+                      const t = getDefaultMealTime(id);
+                      setDrawerMealTime(t);
+                      setDrawerMealTimeStr(decimalToTimeStr(t));
+                    }}
+                    style={{ whiteSpace: 'nowrap', padding: '12px 15px' }}
+                  >
+                    {label}
+                  </button>
+              ))}
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '20px' }}>
+              <label style={{ fontSize: '0.75rem', color: '#888', whiteSpace: 'nowrap' }}>Ora pasto</label>
+              <input
+                type="text"
+                inputMode="numeric"
+                placeholder="12:30"
+                maxLength={5}
+                value={drawerMealTimeStr}
+                onChange={(e) => handleTimeInput(e.target.value)}
+                style={{ width: '70px', padding: '8px 12px', background: '#1a1a1a', border: '1px solid #333', borderRadius: '8px', color: '#fff', fontSize: '0.9rem' }}
+              />
+              <span style={{ fontSize: '0.75rem', color: '#666' }}>(es. 1230 → 12:30)</span>
+            </div>
+            <div style={{ position: 'relative', marginBottom: '20px' }}>
+              {isBarcodeScannerOpen && (
+                <div style={{ marginBottom: '12px', borderRadius: '12px', overflow: 'hidden', background: '#000', border: '1px solid #333' }}>
+                  <video ref={barcodeVideoRef} muted playsInline style={{ width: '100%', maxHeight: '200px', display: 'block' }} />
+                  <div style={{ padding: '8px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: '0.75rem', color: '#888' }}>Inquadra il codice a barre</span>
+                    <button type="button" onClick={() => { setIsBarcodeScannerOpen(false); barcodeStreamRef.current?.getTracks().forEach(t => t.stop()); barcodeStreamRef.current = null; clearInterval(barcodeScanIntervalRef.current); }} style={{ padding: '6px 12px', background: '#333', border: 'none', borderRadius: '8px', color: '#fff', fontSize: '0.8rem', cursor: 'pointer' }}>Chiudi</button>
+                  </div>
+                </div>
+              )}
+              <div className="quick-add-bar">
+                <input
+                  type="text"
+                  className="quick-input input-name"
+                  placeholder="Es. Pollo"
+                  value={foodNameInput}
+                  onChange={(e) => setFoodNameInput(e.target.value)}
+                  onFocus={() => setShowFoodDropdown(true)}
+                  onBlur={() => setTimeout(() => setShowFoodDropdown(false), 200)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') document.getElementById('weight-input')?.focus(); }}
+                />
+                <input id="weight-input" type="number" className="quick-input input-weight" placeholder="g" value={foodWeightInput} onChange={(e) => setFoodWeightInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleAddFoodManual()} />
+                <button type="button" title="Scansiona barcode" onClick={() => setIsBarcodeScannerOpen(prev => !prev)} style={{ padding: '10px 12px', background: isBarcodeScannerOpen ? '#00e5ff' : 'rgba(255,255,255,0.08)', border: '1px solid #333', borderRadius: '10px', cursor: 'pointer', fontSize: '1.1rem' }}>📷</button>
+                <button className="quick-add-btn" onClick={handleAddFoodManual}>+</button>
+              </div>
+              {showFoodDropdown && (foodNameInput.trim() || foodDropdownSuggestions.length > 0) && (
+                <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: '#1a1a1a', border: '1px solid #333', borderRadius: '0 0 12px 12px', maxHeight: '220px', overflowY: 'auto', zIndex: 50, boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}>
+                  {foodDropdownSuggestions.map(s => (
+                    <button key={s.key} type="button" style={{ width: '100%', padding: '12px 16px', textAlign: 'left', background: 'none', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '0.9rem', borderBottom: '1px solid #2a2a2a' }} onClick={() => { setFoodNameInput(s.desc); setFoodWeightInput(getLastQuantityForFood(s.desc) || ''); setShowFoodDropdown(false); setTimeout(() => document.getElementById('weight-input')?.focus(), 50); }}>
+                      {s.desc}
+                    </button>
+                  ))}
+                  {foodNameInput.trim() && (
+                    <button type="button" style={{ width: '100%', padding: '12px 16px', textAlign: 'left', background: 'rgba(179, 136, 255, 0.15)', border: 'none', color: '#b388ff', cursor: isGeneratingFood ? 'wait' : 'pointer', fontSize: '0.9rem', fontWeight: '600' }} onClick={() => generateFoodWithAI(foodNameInput.trim())} disabled={isGeneratingFood}>
+                      {isGeneratingFood ? '⏳ Generazione in corso...' : `✨ Genera con AI: "${foodNameInput.trim()}"`}
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+            <div style={{ minHeight: '100px', marginBottom: '20px' }}>
+              {addedFoods.length === 0 ? (
+                <p style={{ textAlign: 'center', color: '#444', fontSize: '0.8rem', fontStyle: 'italic', marginTop: '30px' }}>Nessun alimento in coda</p>
+              ) : (
+                addedFoods.map((food) => (
+                  <div key={food.id} className="food-pill">
+                    <div><span className="food-pill-name">{food.desc || food.name}</span><span className="food-pill-weight">{food.qta || food.weight}g</span></div>
+                    <div className="food-pill-actions">
+                      <button className="food-pill-btn" onClick={() => setSelectedFoodForInfo(food)} title="Info macro/micro">ℹ️</button>
+                      <button className="food-pill-btn" onClick={() => { setSelectedFoodForEdit({ food, source: 'queue' }); setEditQuantityValue(String(food.qta ?? food.weight ?? 100)); }} title="Modifica quantità">✏️</button>
+                      <button className="food-pill-btn btn-delete" onClick={() => setAddedFoods(addedFoods.filter(f => f.id !== food.id))}>✕</button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+            {addedFoods.length > 0 && (
+              <div style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid #2a2a2a', borderRadius: '12px', padding: '15px', marginBottom: '20px' }}>
+                <h4 style={{ fontSize: '0.65rem', color: '#b388ff', letterSpacing: '1px', marginBottom: '10px', textTransform: 'uppercase' }}>Bilancio Pasto ({mealType})</h4>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
+                  {renderMiniBar('KCAL', currentMealTotals.kcal, targetMacrosPasto.kcal, '#00e5ff')}
+                  {renderMiniBar('PROT (g)', currentMealTotals.prot, targetMacrosPasto.prot, '#b388ff')}
+                  {renderMiniBar('CARB (g)', currentMealTotals.carb, targetMacrosPasto.carb, '#00e676')}
+                  {renderMiniBar('FAT (g)', currentMealTotals.fat, targetMacrosPasto.fat, '#ffea00')}
+                  {renderMiniBar('FIBRE (g)', currentMealTotals.fibre, targetMacrosPasto.fibre, '#ff6d00')}
+                </div>
+              </div>
+            )}
+            <button onClick={saveMealToDiary} style={{ width: '100%', padding: '18px', backgroundColor: '#fff', color: '#000', border: 'none', borderRadius: '15px', fontSize: '0.9rem', fontWeight: 'bold', letterSpacing: '2px', cursor: 'pointer', transition: '0.2s', opacity: addedFoods.length > 0 ? 1 : 0.5 }}>SALVA NEL DIARIO</button>
+          </div>
+        )}
+
+        {/* VISTA DIARIO GIORNALIERO — Solo oggi + Telemetria */}
+        {activeAction === 'diario_giornaliero' && (
+          <div className="view-animate">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
+              <button onClick={() => setActiveAction(null)} style={{ background: 'none', border: 'none', color: '#666', fontSize: '0.8rem', cursor: 'pointer', letterSpacing: '1px' }}>&lt; INDIETRO</button>
+              <h2 style={{ fontSize: '0.8rem', color: '#00e676', letterSpacing: '2px', margin: 0 }}>📓 DIARIO GIORNALIERO</h2>
+              <div style={{ width: '70px' }}></div>
+            </div>
+            <div style={{ display: 'flex', gap: '10px', marginBottom: '20px', background: '#111', padding: '5px', borderRadius: '15px' }}>
+              <button className={`type-btn ${diarioTab === 'storico' ? 'active blue' : ''}`} onClick={() => setDiarioTab('storico')} style={{ border: 'none' }}>OGGI</button>
+              <button className={`type-btn ${diarioTab === 'telemetria' ? 'active blue' : ''}`} onClick={() => setDiarioTab('telemetria')} style={{ border: 'none' }}>TELEMETRIA (40)</button>
+            </div>
+            {diarioTab === 'storico' && (
+              <div style={{ minHeight: '200px' }}>
+                {workoutsLog.length > 0 && (
+                  <div style={{ marginBottom: '20px' }}>
+                    <h4 style={{ fontSize: '0.7rem', color: '#ff6d00', letterSpacing: '1px', marginBottom: '8px' }}>OUTPUT ENERGETICO</h4>
+                    {workoutsLog.map(wk => (
+                      <div key={wk.id} className="food-pill" style={{ borderLeft: '3px solid #ff6d00', background: 'rgba(255, 109, 0, 0.05)' }}>
+                        <div>
+                          <div style={{ fontSize: '0.85rem', fontWeight: '600', color: '#fff' }}>{wk.desc || wk.name}</div>
+                          <div style={{ fontSize: '0.65rem', color: '#888', marginTop: '2px' }}>Stima: {wk.duration || Math.round((wk.kcal || 0) / 6)} min</div>
+                        </div>
+                        <div className="food-pill-actions">
+                          <div style={{ color: '#ff6d00', fontWeight: 'bold', fontSize: '1rem', marginRight: '10px' }}>🔥 {Math.round(wk.kcal || wk.cal || 0)}</div>
+                          <button className="food-pill-btn btn-delete" onClick={() => removeLogItem(wk.id)}>✕</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {Object.keys(groupedFoods).length === 0 && workoutsLog.length === 0 ? (
+                  <p style={{ textAlign: 'center', color: '#444', fontSize: '0.8rem', fontStyle: 'italic' }}>Nessuna traccia registrata oggi.</p>
+                ) : (
+                  Object.keys(groupedFoods).map(meal => (
+                    <div key={meal} style={{ marginBottom: '20px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+                        <h4 style={{ fontSize: '0.7rem', color: '#888', letterSpacing: '1px', margin: 0, cursor: 'pointer', flex: 1 }} onClick={() => loadMealToConstructor(meal)}>
+                          {meal === 'merenda1' ? 'Snack Mattina' : meal === 'merenda2' ? 'Snack Pomeriggio' : meal}
+                        </h4>
+                        <button type="button" className="food-pill-btn" onClick={() => loadMealToConstructor(meal)} title="Modifica pasto nel Costruttore">✏️</button>
+                      </div>
+                      {groupedFoods[meal].map(food => (
+                        <div key={food.id} className="food-pill" style={{ borderLeft: '3px solid #333', cursor: 'pointer' }} onClick={() => loadMealToConstructor(food.mealType)}>
+                          <div>
+                            <span className="food-pill-name">{food.desc || food.name}</span>
+                            <span className="food-pill-weight">{food.qta || food.weight}g</span>
+                          </div>
+                          <div className="food-pill-actions" onClick={(e) => e.stopPropagation()}>
+                            <button className="food-pill-btn" onClick={(e) => { e.stopPropagation(); setSelectedFoodForInfo(food); }} title="Info macro/micro">ℹ️</button>
+                            <button className="food-pill-btn" onClick={(e) => { e.stopPropagation(); loadMealToConstructor(food.mealType); }} title="Modifica nel Costruttore">✏️</button>
+                            <div style={{ fontSize: '0.75rem', color: '#888', marginRight: '10px' }}>{Math.round(food.kcal || food.cal || 0)} kcal</div>
+                            <button className="food-pill-btn btn-delete" onClick={(e) => { e.stopPropagation(); removeLogItem(food.id); }}>✕</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+            {diarioTab === 'telemetria' && (
+              <div className="view-animate">
+                <div style={{ display: 'flex', gap: '5px', marginBottom: '20px', overflowX: 'auto', paddingBottom: '5px' }}>
+                  {['macro', 'bilanci', 'amino', 'vit', 'min', 'fat'].map(t => (
+                    <button key={t} onClick={() => setTelemetrySubTab(t)} style={{ padding: '8px 15px', fontSize: '0.7rem', background: telemetrySubTab === t ? '#00e676' : '#111', color: telemetrySubTab === t ? '#000' : '#888', border: 'none', borderRadius: '20px', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{t}</button>
+                  ))}
+                </div>
+                <div style={{ background: '#111', padding: '20px', borderRadius: '15px' }}>
+                  {telemetrySubTab === 'macro' && (<> {renderProgressBar('PROTEINE', totali.prot, TARGETS.macro.prot, 'g', 'prot')} {renderProgressBar('CARBOIDRATI', totali.carb, TARGETS.macro.carb, 'g', 'carb')} {renderProgressBar('GRASSI TOTALI', totali.fatTotal, TARGETS.macro.fatTotal, 'g', 'fatTotal')} </>)}
+                  {telemetrySubTab === 'bilanci' && (
+                    <div className="view-animate">
+                      <h4 style={{ fontSize: '0.7rem', color: '#b0bec5', letterSpacing: '1px', marginBottom: '15px' }}>RAPPORTI BIOCHIMICI</h4>
+                      {renderRatioBar(
+                        'Equilibrio Elettrolitico (Idratazione)',
+                        'Sodio (Na)', totali?.na,
+                        'Potassio (K)', totali?.k,
+                        'Ideale: Na < K',
+                        (Number(totali?.na) || 0) < (Number(totali?.k) || 0)
+                      )}
+                      {renderRatioBar(
+                        'Indice Infiammatorio (Grassi)',
+                        'Omega 6', totali?.omega6,
+                        'Omega 3', totali?.omega3,
+                        'Ideale: W6:W3 < 4:1',
+                        (Number(totali?.omega6) || 0) <= (Number(totali?.omega3) || 1) * 4
+                      )}
+                    </div>
+                  )}
+                  {telemetrySubTab === 'amino' && (<> {Object.keys(TARGETS.amino).map(k => renderProgressBar(k.toUpperCase(), totali[k] || 0, TARGETS.amino[k], 'mg', k))} </>)}
+                  {telemetrySubTab === 'vit' && (<> {Object.keys(TARGETS.vit).map(k => renderProgressBar(k.toUpperCase(), totali[k] || 0, TARGETS.vit[k], k === 'vitA' || k === 'b9' ? 'µg' : 'mg', k))} </>)}
+                  {telemetrySubTab === 'min' && (<> {Object.keys(TARGETS.min).map(k => renderProgressBar(k.toUpperCase(), totali[k] || 0, TARGETS.min[k], k === 'se' ? 'µg' : 'mg', k))} </>)}
+                  {telemetrySubTab === 'fat' && (<> {Object.keys(TARGETS.fat).map(k => renderProgressBar(k.toUpperCase(), totali[k] || 0, TARGETS.fat[k], 'g', k))} </>)}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* VISTA ARCHIVIO STORICO — Ricerca per data + elenco giorni passati */}
+        {activeAction === 'storico' && (
+          <div className="view-animate">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
+              <button onClick={() => setActiveAction(null)} style={{ background: 'none', border: 'none', color: '#666', fontSize: '0.8rem', cursor: 'pointer', letterSpacing: '1px' }}>&lt; INDIETRO</button>
+              <h2 style={{ fontSize: '0.8rem', color: '#b0bec5', letterSpacing: '2px', margin: 0 }}>📚 ARCHIVIO STORICO</h2>
+              <div style={{ width: '70px' }}></div>
+            </div>
+            <div style={{ marginBottom: '20px' }}>
+              <label style={{ display: 'block', fontSize: '0.7rem', color: '#888', letterSpacing: '1px', marginBottom: '8px' }}>Cerca per data</label>
+              <input
+                type="date"
+                value={selectedHistoryDate}
+                onChange={(e) => setSelectedHistoryDate(e.target.value)}
+                style={{ width: '100%', padding: '12px 14px', background: '#111', border: '1px solid #2a2a2a', borderRadius: '10px', color: '#fff', fontSize: '0.9rem', outline: 'none' }}
+              />
+            </div>
+            <div style={{ marginBottom: '24px', background: 'rgba(255,255,255,0.02)', padding: '15px', borderRadius: '12px', border: '1px solid #2a2a2a' }}>
+              <h4 style={{ fontSize: '0.7rem', color: '#b0bec5', letterSpacing: '1px', marginBottom: '15px' }}>TREND CALORICO ULTIMI 7 GIORNI</h4>
+              {weeklyTrendData.length > 0 ? (
+                <ResponsiveContainer width="100%" height={160}>
+                  <BarChart data={weeklyTrendData} margin={{ top: 10, right: 0, left: -25, bottom: 0 }}>
+                    <XAxis dataKey="shortDate" tick={{ fill: '#666', fontSize: 10 }} axisLine={false} tickLine={false} />
+                    <YAxis domain={[0, (min, max) => (max ?? 0) + 200]} tick={{ fill: '#666', fontSize: 10 }} axisLine={false} tickLine={false} />
+                    <Tooltip cursor={{ fill: 'rgba(255,255,255,0.05)' }} contentStyle={{ backgroundColor: '#111', border: '1px solid #333', borderRadius: '8px', fontSize: '0.8rem' }} />
+                    <ReferenceLine y={STRATEGY_PROFILES[dayProfile]?.kcal || 2300} stroke="rgba(0, 229, 255, 0.4)" strokeDasharray="3 3" />
+                    <Bar dataKey="calorie" fill="#b0bec5" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <p style={{ fontSize: '0.75rem', color: '#666', fontStyle: 'italic', textAlign: 'center' }}>Dati insufficienti per il trend settimanale.</p>
+              )}
+            </div>
+            {weeklyTrendData.length > 0 && (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px', marginBottom: '24px' }}>
+                <div style={{ background: 'rgba(255,255,255,0.02)', padding: '15px', borderRadius: '12px', border: '1px solid #2a2a2a' }}>
+                  <h4 style={{ fontSize: '0.65rem', color: '#ffea00', letterSpacing: '1px', marginBottom: '15px' }}>GRASSI (7 GIORNI)</h4>
+                  {renderWeeklyBar('Grassi Totali', weeklyMicrosTotals.fatTotal, TARGETS.macro.fatTotal, 'g', 'fatTotal')}
+                  {renderWeeklyBar('Omega 3', weeklyMicrosTotals.omega3, TARGETS.fat.omega3, 'g', 'omega3')}
+                  {renderWeeklyBar('Omega 6', weeklyMicrosTotals.omega6, TARGETS.fat.omega6, 'g', 'omega6')}
+                </div>
+                <div style={{ background: 'rgba(255,255,255,0.02)', padding: '15px', borderRadius: '12px', border: '1px solid #2a2a2a' }}>
+                  <h4 style={{ fontSize: '0.65rem', color: '#00e676', letterSpacing: '1px', marginBottom: '15px' }}>ACCUMULABILI (LIPO + B12)</h4>
+                  {renderWeeklyBar('Vitamina A', weeklyMicrosTotals.vitA, TARGETS.vit.vitA, 'µg', 'vitA')}
+                  {renderWeeklyBar('Vitamina D', weeklyMicrosTotals.vitD, TARGETS.vit.vitD, 'µg', 'vitD')}
+                  {renderWeeklyBar('Vitamina E', weeklyMicrosTotals.vitE, TARGETS.vit.vitE, 'mg', 'vitE')}
+                  {renderWeeklyBar('Vitamina K', weeklyMicrosTotals.vitK, TARGETS.vit.vitK, 'µg', 'vitK')}
+                  {renderWeeklyBar('Vitamina B12', weeklyMicrosTotals.vitB12, TARGETS.vit.vitB12, 'µg', 'vitB12')}
+                </div>
+              </div>
+            )}
+            {selectedHistoryDate && (
+              <div style={{ marginBottom: '24px', padding: '16px', background: 'rgba(176, 190, 197, 0.06)', border: '1px solid rgba(176, 190, 197, 0.2)', borderRadius: '12px' }}>
+                {selectedDayData ? (
+                  <>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px', marginBottom: '12px', fontSize: '0.8rem' }}>
+                      <span style={{ color: '#b0bec5' }}>{new Date(selectedHistoryDate + 'T12:00:00').toLocaleDateString('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric' })}</span>
+                      <span style={{ color: '#00e5ff' }}>{Math.round(selectedDayData.calorie)} kcal</span>
+                      <span style={{ color: '#b388ff' }}>{selectedDayData.proteine.toFixed(1)} g prot</span>
+                      <span style={{ color: selectedDayData.deficit < 0 ? '#00e676' : selectedDayData.deficit > 0 ? '#ff6d00' : '#888' }}>
+                        {selectedDayData.deficit < 0 ? `${selectedDayData.deficit} kcal (Deficit)` : selectedDayData.deficit > 0 ? `+${selectedDayData.deficit} kcal (Surplus)` : '0 kcal (Pari)'}
+                      </span>
+                    </div>
+                    <h4 style={{ fontSize: '0.7rem', color: '#b0bec5', letterSpacing: '1px', marginBottom: '8px' }}>Dettaglio</h4>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                      {(selectedDayData.log || []).map((entry, idx) => {
+                        if (entry.type === 'meal' && entry.items) {
+                          const tot = (entry.items || []).reduce((a, it) => ({ prot: a.prot + (it.prot || 0), cal: a.cal + ((it.cal || it.kcal) || 0) }), { prot: 0, cal: 0 });
+                          return (
+                            <div key={idx}>
+                              <div style={{ fontSize: '0.8rem', fontWeight: '600', color: '#e4e6eb' }}>{entry.desc || 'Pasto'} — {tot.prot.toFixed(1)} g prot, {Math.round(tot.cal)} kcal</div>
+                              {(entry.items || []).map((item, i) => (
+                                <div key={i} style={{ paddingLeft: '12px', fontSize: '0.75rem', color: '#b0b3b8' }}>{item.desc} · {(item.qta || item.weight) || ''}g · {Math.round((item.cal || item.kcal) || 0)} kcal</div>
+                              ))}
+                            </div>
+                          );
+                        }
+                        if (entry.type === 'single' || !entry.type) {
+                          return <div key={idx} style={{ fontSize: '0.8rem', color: '#b0b3b8' }}>{entry.desc} · {Math.round((entry.cal || entry.kcal) || 0)} kcal</div>;
+                        }
+                        if (entry.type === 'workout') {
+                          return <div key={idx} style={{ fontSize: '0.8rem', color: '#ff6d00' }}>{entry.desc} — {Math.round((entry.cal || entry.kcal) || 0)} kcal (bruciate)</div>;
+                        }
+                        return null;
+                      })}
+                    </div>
+                  </>
+                ) : (
+                  <p style={{ margin: 0, fontSize: '0.85rem', color: '#888', fontStyle: 'italic' }}>Nessun dato registrato per questa data.</p>
+                )}
+              </div>
+            )}
+            <h3 className="diary-group-title" style={{ borderLeftColor: '#b0bec5', marginBottom: '12px' }}>Tutti i giorni</h3>
+            {pastDaysStorico.length === 0 ? (
+              <p style={{ textAlign: 'center', color: '#444', fontSize: '0.8rem', fontStyle: 'italic' }}>Nessun giorno passato in archivio.</p>
+            ) : (
+              <div className="storico-accordion">
+                {pastDaysStorico.map(({ dataStr, log, calorie, proteine, deficit }) => {
+                  const isExpanded = expandedStoricoDate === dataStr;
+                  const dataFormatted = new Date(dataStr + 'T12:00:00').toLocaleDateString('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric' });
+                  const deficitText = deficit < 0 ? `${deficit} kcal (Deficit)` : deficit > 0 ? `+${deficit} kcal (Surplus)` : '0 kcal (Pari)';
+                  return (
+                    <div key={dataStr} style={{ marginBottom: '8px', border: '1px solid #2a2a2a', borderRadius: '12px', overflow: 'hidden', background: isExpanded ? 'rgba(176, 190, 197, 0.06)' : 'rgba(255,255,255,0.02)' }}>
+                      <button type="button" onClick={() => setExpandedStoricoDate(isExpanded ? null : dataStr)} style={{ width: '100%', padding: '14px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', background: 'none', border: 'none', color: '#fff', cursor: 'pointer', textAlign: 'left', flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: '0.9rem', fontWeight: '600' }}>{dataFormatted}</span>
+                        <span style={{ fontSize: '0.75rem', color: '#00e5ff' }}>{Math.round(calorie)} kcal</span>
+                        <span style={{ fontSize: '0.75rem', color: '#b388ff' }}>{proteine.toFixed(1)} g prot</span>
+                        <span style={{ fontSize: '0.75rem', color: deficit < 0 ? '#00e676' : deficit > 0 ? '#ff6d00' : '#888' }}>{deficitText}</span>
+                        <span style={{ fontSize: '1rem', transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.2s' }}>▶</span>
+                      </button>
+                      {isExpanded && (
+                        <div style={{ padding: '12px 16px 16px', borderTop: '1px solid #2a2a2a', background: 'rgba(0,0,0,0.3)' }}>
+                          <h4 style={{ fontSize: '0.7rem', color: '#b0bec5', letterSpacing: '1px', marginBottom: '10px' }}>Dettaglio pasti e alimenti</h4>
+                          {(log || []).length === 0 ? (
+                            <p style={{ fontSize: '0.8rem', color: '#666', fontStyle: 'italic' }}>Nessun dettaglio per questo giorno.</p>
+                          ) : (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                              {(log || []).map((entry, idx) => {
+                                if (entry.type === 'meal' && entry.items) {
+                                  const totPasto = (entry.items || []).reduce((a, it) => ({ prot: a.prot + (it.prot || 0), cal: a.cal + ((it.cal || it.kcal) || 0) }), { prot: 0, cal: 0 });
+                                  return (
+                                    <div key={idx} style={{ marginBottom: '4px' }}>
+                                      <div style={{ fontSize: '0.8rem', fontWeight: '600', color: '#e4e6eb', marginBottom: '4px' }}>{entry.desc || 'Pasto'} — {totPasto.prot.toFixed(1)} g prot, {Math.round(totPasto.cal)} kcal</div>
+                                      {(entry.items || []).map((item, i) => (
+                                        <div key={i} style={{ paddingLeft: '16px', fontSize: '0.8rem', color: '#b0b3b8', display: 'flex', justifyContent: 'space-between' }}>
+                                          <span>{item.desc}</span>
+                                          <span>{item.qta || item.weight}g · {(item.prot || 0).toFixed(1)} g · {Math.round((item.cal || item.kcal) || 0)} kcal</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  );
+                                }
+                                if (entry.type === 'single' || !entry.type) {
+                                  return (
+                                    <div key={idx} style={{ fontSize: '0.8rem', color: '#b0b3b8', display: 'flex', justifyContent: 'space-between' }}>
+                                      <span>{entry.desc}</span>
+                                      <span>{(entry.qta || entry.weight) || ''}g · {(entry.prot || 0).toFixed(1)} g · {Math.round((entry.cal || entry.kcal) || 0)} kcal</span>
+                                    </div>
+                                  );
+                                }
+                                if (entry.type === 'workout') {
+                                  return (
+                                    <div key={idx} style={{ fontSize: '0.8rem', color: '#ff6d00', display: 'flex', justifyContent: 'space-between' }}>
+                                      <span>{entry.desc}</span>
+                                      <span>{Math.round((entry.cal || entry.kcal) || 0)} kcal (bruciate)</span>
+                                    </div>
+                                  );
+                                }
+                                return null;
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* VISTA ZEN */}
+        {activeAction === 'focus' && (
+          <div className="view-animate">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+              <button onClick={() => { setIsZenActive(false); setActiveAction(null); }} style={{ background: 'none', border: 'none', color: '#666', fontSize: '0.8rem', cursor: 'pointer', letterSpacing: '1px' }}>&lt; INDIETRO</button>
+              <h2 style={{ fontSize: '0.8rem', color: '#fbc02d', letterSpacing: '2px', margin: 0 }}>🧘 NEURAL RESET</h2>
+              <div style={{ width: '70px' }}></div>
+            </div>
+            <p style={{ textAlign: 'center', color: '#888', fontSize: '0.75rem', marginBottom: '20px' }}>Sincronizza il respiro con l'anello per abbassare il ritmo cardiaco.</p>
+            <div className="zen-container">
+              <div className={`zen-orb ${isZenActive ? 'breathing' : ''}`}></div>
+              <div className="zen-rings"></div>
+              <div className="zen-instruction" style={{ display: isZenActive ? 'block' : 'none' }}></div>
+              {!isZenActive && <div style={{ position: 'absolute', bottom: '0', fontSize: '0.8rem', color: '#555', letterSpacing: '2px' }}>IN ATTESA</div>}
+            </div>
+            <button onClick={() => setIsZenActive(!isZenActive)} style={{ width: '100%', padding: '18px', backgroundColor: isZenActive ? '#222' : '#fbc02d', color: isZenActive ? '#fbc02d' : '#000', border: isZenActive ? '1px solid #fbc02d' : 'none', borderRadius: '15px', fontSize: '0.9rem', fontWeight: 'bold', letterSpacing: '2px', cursor: 'pointer', transition: '0.3s', boxShadow: isZenActive ? 'none' : '0 0 20px rgba(251, 192, 45, 0.3)' }}>
+              {isZenActive ? 'TERMINA SESSIONE' : 'AVVIA CICLO'}
+            </button>
+          </div>
+        )}
+
+        {/* Modale Info alimento — macro/micro */}
+        {selectedFoodForInfo && (
+          <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100, padding: '20px' }} onClick={() => setSelectedFoodForInfo(null)}>
+            <div style={{ background: '#111', border: '1px solid #333', borderRadius: '16px', maxWidth: '400px', width: '100%', maxHeight: '80vh', overflow: 'auto', padding: '20px' }} onClick={e => e.stopPropagation()}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                <h3 style={{ margin: 0, fontSize: '1rem', color: '#00e5ff' }}>{selectedFoodForInfo.desc || selectedFoodForInfo.name}</h3>
+                <button style={{ background: 'none', border: 'none', color: '#888', fontSize: '1.2rem', cursor: 'pointer' }} onClick={() => setSelectedFoodForInfo(null)}>✕</button>
+              </div>
+              <p style={{ fontSize: '0.75rem', color: '#888', marginBottom: '12px' }}>{(selectedFoodForInfo.qta ?? selectedFoodForInfo.weight ?? 100)} g</p>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', fontSize: '0.8rem' }}>
+                <span style={{ color: '#aaa' }}>Kcal</span><span style={{ color: '#fff' }}>{Math.round(selectedFoodForInfo.kcal ?? selectedFoodForInfo.cal ?? 0)}</span>
+                <span style={{ color: '#aaa' }}>Proteine</span><span style={{ color: '#fff' }}>{(Number(selectedFoodForInfo.prot) ?? 0).toFixed(1)} g</span>
+                <span style={{ color: '#aaa' }}>Carboidrati</span><span style={{ color: '#fff' }}>{(Number(selectedFoodForInfo.carb) ?? 0).toFixed(1)} g</span>
+                <span style={{ color: '#aaa' }}>Grassi</span><span style={{ color: '#fff' }}>{(Number(selectedFoodForInfo.fatTotal) ?? 0).toFixed(1)} g</span>
+                <span style={{ color: '#aaa' }}>Fibre</span><span style={{ color: '#fff' }}>{(Number(selectedFoodForInfo.fibre) ?? 0).toFixed(1)} g</span>
+              </div>
+              <div style={{ marginTop: '16px', fontSize: '0.7rem', color: '#666' }}>Vitamine e minerali disponibili nel motore biochimico (40+ parametri) sono inclusi nel calcolo giornaliero.</div>
+            </div>
+          </div>
+        )}
+
+        {/* Modale Edit quantità */}
+        {selectedFoodForEdit && (
+          <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100, padding: '20px' }} onClick={() => setSelectedFoodForEdit(null)}>
+            <div style={{ background: '#111', border: '1px solid #333', borderRadius: '16px', maxWidth: '340px', width: '100%', padding: '20px' }} onClick={e => e.stopPropagation()}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                <h3 style={{ margin: 0, fontSize: '1rem', color: '#00e676' }}>Modifica quantità</h3>
+                <button style={{ background: 'none', border: 'none', color: '#888', fontSize: '1.2rem', cursor: 'pointer' }} onClick={() => setSelectedFoodForEdit(null)}>✕</button>
+              </div>
+              <p style={{ fontSize: '0.85rem', color: '#ccc', marginBottom: '8px' }}>{selectedFoodForEdit.food?.desc || selectedFoodForEdit.food?.name}</p>
+              <input type="number" min="1" step="1" value={editQuantityValue} onChange={(e) => setEditQuantityValue(e.target.value)} style={{ width: '100%', padding: '12px', background: '#222', border: '1px solid #444', borderRadius: '8px', color: '#fff', fontSize: '1rem', marginBottom: '16px' }} placeholder="Grammi" />
+              <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
+                <button style={{ padding: '10px 18px', background: '#333', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer' }} onClick={() => setSelectedFoodForEdit(null)}>Annulla</button>
+                <button style={{ padding: '10px 18px', background: '#00e676', color: '#000', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 'bold' }} onClick={() => {
+                  const qta = parseFloat(editQuantityValue);
+                  if (!Number.isFinite(qta) || qta <= 0) return;
+                  const { food, source } = selectedFoodForEdit;
+                  const newItem = { ...estraiDatiFoodDb(food.desc || food.name, qta, food.mealType), id: food.id };
+                  if (source === 'queue') setAddedFoods(prev => prev.map(f => f.id === food.id ? newItem : f));
+                  else if (source === 'diary') setDailyLog(prev => prev.map(f => f.id === food.id ? newItem : f));
+                  setSelectedFoodForEdit(null);
+                }}>Salva</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+      </div>
+      {nutrientModal && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 120, padding: '20px' }} onClick={() => setNutrientModal(null)}>
+          <div style={{ background: '#111', border: '1px solid #333', borderRadius: '16px', maxWidth: '350px', width: '100%', maxHeight: '80vh', overflow: 'auto', padding: '20px', boxShadow: '0 10px 40px rgba(0,0,0,0.8)' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+              <h3 style={{ margin: 0, fontSize: '0.9rem', color: '#00e5ff', textTransform: 'uppercase', letterSpacing: '1px' }}>Fonti di {nutrientModal.label}</h3>
+              <button style={{ background: 'none', border: 'none', color: '#888', fontSize: '1.2rem', cursor: 'pointer' }} onClick={() => setNutrientModal(null)}>✕</button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {getNutrientSources(nutrientModal.key, nutrientModal.target, nutrientModal.isWeekly).length === 0 ? (
+                <p style={{ fontSize: '0.8rem', color: '#666', fontStyle: 'italic', textAlign: 'center', padding: '20px 0' }}>Nessuna fonte registrata.</p>
+              ) : (
+                getNutrientSources(nutrientModal.key, nutrientModal.target, nutrientModal.isWeekly).map((src, idx) => (
+                  <div key={idx} style={{ background: 'rgba(255,255,255,0.04)', padding: '12px 15px', borderRadius: '10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', border: '1px solid rgba(255,255,255,0.05)' }}>
+                    <span style={{ fontSize: '0.85rem', color: '#eee', fontWeight: '500', flex: 1 }}>{src.name}</span>
+                    <div style={{ textAlign: 'right', marginLeft: '10px' }}>
+                      <div style={{ fontSize: '0.9rem', color: src.percent > 50 ? '#00e676' : '#00e5ff', fontWeight: 'bold' }}>{src.percent.toFixed(1)}%</div>
+                      <div style={{ fontSize: '0.65rem', color: '#888' }}>{src.amount.toFixed(1)} {nutrientModal.unit}</div>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      {showNodeModal && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 130, padding: '20px' }} onClick={() => setShowNodeModal(false)}>
+          <div style={{ background: '#111', border: '1px solid #333', borderRadius: '16px', maxWidth: '350px', width: '100%', padding: '20px', boxShadow: '0 10px 40px rgba(0,0,0,0.8)' }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 20px 0', fontSize: '1rem', color: '#fff' }}>Aggiungi Evento</h3>
+
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '20px' }}>
+              {[
+                { id: 'meal', label: '🍎 PASTO' },
+                { id: 'workout', label: '🏋️ SPORT' },
+                { id: 'work', label: '💼 LAVORO' }
+              ].map(t => (
+                <button key={t.id} onClick={() => setNodeForm(prev => ({ ...prev, type: t.id }))} style={{ flex: 1, padding: '10px 5px', fontSize: '0.75rem', borderRadius: '8px', border: '1px solid #333', background: nodeForm.type === t.id ? '#00e5ff' : '#222', color: nodeForm.type === t.id ? '#000' : '#888', fontWeight: nodeForm.type === t.id ? 'bold' : 'normal', cursor: 'pointer' }}>
+                  {t.label}
+                </button>
+              ))}
+            </div>
+
+            <div style={{ marginBottom: '15px' }}>
+              <label style={{ display: 'block', fontSize: '0.75rem', color: '#aaa', marginBottom: '5px' }}>Orario Inizio (0-24)</label>
+              <input type="number" min="0" max="24" step="0.5" value={nodeForm.start} onChange={e => setNodeForm(prev => ({ ...prev, start: e.target.value }))} style={{ width: '100%', padding: '10px', background: '#222', border: '1px solid #444', color: '#fff', borderRadius: '8px' }} />
+            </div>
+
+            {nodeForm.type === 'work' && (
+              <div style={{ marginBottom: '15px' }}>
+                <label style={{ display: 'block', fontSize: '0.75rem', color: '#ffea00', marginBottom: '5px' }}>Orario Fine</label>
+                <input type="number" min={Number(nodeForm.start) + 0.5} max="24" step="0.5" value={nodeForm.end} onChange={e => setNodeForm(prev => ({ ...prev, end: e.target.value }))} style={{ width: '100%', padding: '10px', background: '#222', border: '1px solid #ffea00', color: '#fff', borderRadius: '8px' }} />
+              </div>
+            )}
+
+            {(nodeForm.type === 'work' || nodeForm.type === 'workout') && (
+              <div style={{ marginBottom: '20px' }}>
+                <label style={{ display: 'block', fontSize: '0.75rem', color: '#ff6d00', marginBottom: '5px' }}>Dispendio Stimato (Kcal)</label>
+                <input type="number" step="50" value={nodeForm.kcal} onChange={e => setNodeForm(prev => ({ ...prev, kcal: e.target.value }))} style={{ width: '100%', padding: '10px', background: '#222', border: '1px solid #ff6d00', color: '#fff', borderRadius: '8px' }} />
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: '10px', marginTop: '10px' }}>
+              <button type="button" onClick={() => setShowNodeModal(false)} style={{ flex: 1, padding: '12px', background: 'transparent', border: '1px solid #444', color: '#aaa', borderRadius: '8px', cursor: 'pointer' }}>Annulla</button>
+              <button type="button" onClick={saveNewTimelineNode} style={{ flex: 1, padding: '12px', background: '#fff', border: 'none', color: '#000', borderRadius: '8px', fontWeight: 'bold', cursor: 'pointer' }}>Aggiungi</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

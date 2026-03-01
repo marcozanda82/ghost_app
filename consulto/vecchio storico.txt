@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Storico Dettagliato - Tabella Trend</title>
+    <link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0d47a1">
+<link rel="apple-touch-icon" href="icon-192.png">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f4f7f9; color: #333; margin: 0; padding: 20px; display: flex; justify-content: center; align-items: flex-start; }
+        .container { width: 100%; max-width: 950px; }
+        h1 { color: #0d47a1; border-bottom: 2px solid #e0e0e0; padding-bottom: 10px; margin-top: 0; margin-bottom: 20px;}
+        .nav-links { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; }
+        .nav-links a, .nav-links button { display: inline-block; padding: 10px 15px; background-color: #607d8b; color: white; text-decoration: none; border-radius: 6px; font-weight: 600; cursor: pointer; border: none; }
+        .nav-links a:hover, .nav-links button:hover { opacity: 0.9; }
+
+        .storico-table { width: 100%; border-collapse: collapse; background-color: #fff; box-shadow: 0 2px 8px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden;}
+        th, td { padding: 12px 15px; text-align: left; vertical-align: middle; }
+        th { background-color: #e8eaf6; font-weight: 600; color: #3f51b5; }
+        .day-summary-row { border-bottom: 2px solid #e0e0e0; cursor: pointer; transition: background-color 0.2s; }
+        .day-summary-row:hover { background-color: #f9f9fc; }
+        .day-summary-row.expanded { background-color: #f1f3f9; }
+        
+        .day-detail-row { display: none; }
+        .day-detail-row.expanded { display: table-row; }
+        .detail-cell { padding: 20px !important; background-color: #fafafa; }
+        .detail-cell h4 { margin-top: 0; }
+        .detail-cell table { width: 100%; box-shadow: none; border-radius: 0; font-size: 0.9em; }
+        
+        .expand-arrow { display: inline-block; transition: transform 0.2s; font-size: 0.8em; }
+        .day-summary-row.expanded .expand-arrow { transform: rotate(90deg); }
+
+        .meal-group-row { background-color: #f5f5f5; font-weight: bold; cursor: pointer; }
+        .meal-expand-arrow { display: inline-block; width: 20px; transition: transform 0.2s; }
+        .meal-group-row.expanded .meal-expand-arrow { transform: rotate(90deg); }
+        .sub-item-row { display: none; }
+        .meal-group-row.expanded + .sub-item-row { display: table-row; } 
+        .meal-group-row.expanded ~ .sub-item-row.meal-active { display: table-row; }
+
+        .trend-muscle { font-size: 1.5em; font-weight: bold; }
+        .trend-up { color: #4caf50; }
+        .trend-down { color: #f44336; }
+        .trend-neutral { color: #9e9e9e; }
+        .note-icon {
+            cursor: pointer;
+            font-style: normal;
+            font-size: 1.2em;
+            display: inline-block;
+            text-align: center;
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Storico e Trend Giornalieri</h1>
+       <div class="nav-links">
+    <a href="index.html">⬅️ Torna al Tracker</a>
+    
+    <button id="btn-esporta-storico-ai" style="background-color: #673ab7; color: white; border: none; padding: 10px 15px; border-radius: 6px; font-weight: 600; cursor: pointer;">
+        🧠 Dati Completi per AI
+    </button>
+</div>
+        <div class="storico-table-container">
+            <table class="storico-table">
+                <thead>
+                    <tr>
+                        <th>Data</th>
+                        <th>Proteine</th>
+                        <th>Calorie</th>
+                        <th>Workout</th>
+                        <th>Deficit/Surplus</th>
+                        <th>Grasso (g)</th>
+                        <th>Massa Musc.</th>
+                        <th>Note</th>
+                    </tr>
+                </thead>
+                <tbody id="storico-body"></tbody>
+            </table>
+        </div>
+    </div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    const storicoBody = document.getElementById('storico-body');
+
+    function caricaTuttoLoStorico() {
+        const storicoDati = [];
+        const dateViste = new Set(); 
+
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key.startsWith('trackerStorico_')) {
+                try {
+                    const dataString = key.replace('trackerStorico_', '');
+                    
+                    if (dateViste.has(dataString)) {
+                        console.warn(`Saltando potenziale duplicato per la data: ${dataString}`);
+                        continue; 
+                    }
+
+                    const datiGiorno = JSON.parse(localStorage.getItem(key));
+                    
+                    if (datiGiorno) {
+                        if (!datiGiorno.data || datiGiorno.data !== dataString) {
+                             console.warn(`Inconsistenza data nella chiave ${key}. Usando la data dalla chiave.`);
+                        }
+                        storicoDati.push({ data: dataString, ...datiGiorno });
+                        dateViste.add(dataString);
+                    }
+
+                } catch (e) {
+                    console.error("Errore nel parsing dei dati storici per la chiave:", key, e);
+                }
+            }
+        }
+
+        storicoDati.sort((a, b) => new Date(b.data) - new Date(a.data));
+        return storicoDati;
+    }
+
+    const PIANO_SETTIMANALE = {
+        0: { tipo: '💧 Riposo (Deficit)', cal: 2300, prot: 140 },
+        1: { tipo: '🔥 Forza (Mantenimento)', cal: 2300, prot: 140 },
+        2: { tipo: '💪 Forza (Mantenimento)', cal: 2300, prot: 140 },
+        3: { tipo: '🏃 Cardio (Deficit)', cal: 2300, prot: 140 },
+        4: { tipo: '🏋️ Forza (Mantenimento)', cal: 2300, prot: 140 },
+        5: { tipo: '🏃 Cardio (Deficit)', cal: 2300, prot: 140 },
+        6: { tipo: '🥗 Mantenimento (Free)', cal: 2300, prot: 140 }
+    };
+
+    function renderStorico() {
+        const storico = caricaTuttoLoStorico();
+
+        if (storico.length === 0) {
+            storicoBody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 20px;">Nessun dato storico trovato.</td></tr>';
+            return;
+        }
+
+        storicoBody.innerHTML = ''; 
+
+        storico.forEach((giorno, giornoIndex) => {
+            let totaliGiorno = { proteine: 0, calorie: 0, mg: 0, k: 0, vitc: 0, ca: 0 };
+            let totalWorkoutCaloriesLogged = 0; 
+
+            (giorno.log || []).forEach(entry => {
+                if (entry.type === 'meal' && entry.items) {
+                    entry.items.forEach(item => {
+                        totaliGiorno.proteine += item.prot || 0;
+                        totaliGiorno.calorie += (item.cal || item.kcal) || 0; 
+                        totaliGiorno.mg += item.mg || 0;
+                        totaliGiorno.k += item.k || 0;
+                        totaliGiorno.vitc += item.vitc || 0;
+                        totaliGiorno.ca += item.ca || 0;
+                    });
+                } else if (entry.type === 'single') { 
+                    totaliGiorno.proteine += entry.prot || 0;
+                    totaliGiorno.calorie += (entry.cal || entry.kcal) || 0; 
+                    totaliGiorno.mg += entry.mg || 0;
+                    totaliGiorno.k += entry.k || 0;
+                    totaliGiorno.vitc += entry.vitc || 0;
+                    totaliGiorno.ca += entry.ca || 0;
+                } else if (entry.type === 'workout') {
+                    totalWorkoutCaloriesLogged += (entry.cal || entry.kcal) || 0; 
+                }
+            });
+
+            const workoutCalories = totalWorkoutCaloriesLogged;
+            
+            const dataDelGiorno = new Date(giorno.data);
+            const giornoSettimana = dataDelGiorno.getDay(); 
+            const pianoDelGiorno = PIANO_SETTIMANALE[giornoSettimana] || PIANO_SETTIMANALE[1];
+            
+            const obiettivoCalorieTotale = pianoDelGiorno.cal + workoutCalories;
+
+            const deficitEffettivo = totaliGiorno.calorie - obiettivoCalorieTotale;
+            const deficitArrotondato = Math.round(deficitEffettivo);
+
+            let deficitSurplusText = '';
+            if (deficitArrotondato < 0) {
+                deficitSurplusText = `${deficitArrotondato} kcal (Deficit)`; 
+            } else if (deficitArrotondato > 0) {
+                deficitSurplusText = `+${deficitArrotondato} kcal (Surplus)`; 
+            } else {
+                deficitSurplusText = `0 kcal (Pari)`;
+            }
+
+            let variazioneGrasso = 0; 
+            let testoVariazioneGrasso = '';
+
+            if (deficitArrotondato < 0) { 
+                variazioneGrasso = (Math.abs(deficitArrotondato) / 7.7);
+                testoVariazioneGrasso = '-' + variazioneGrasso.toFixed(1) + ' g';
+            } else if (deficitArrotondato > 0) { 
+                variazioneGrasso = (deficitArrotondato / 7.7);
+                testoVariazioneGrasso = '+' + variazioneGrasso.toFixed(1) + ' g';
+            } else { 
+                testoVariazioneGrasso = '0.0 g';
+            }
+            
+            let trendMuscoloHtml = '<span class="trend-neutral trend-muscle">―</span>';
+            let scoreMuscolo = 0;
+
+            if(totaliGiorno.proteine >= (pianoDelGiorno.prot * 0.95)) {
+                scoreMuscolo++;
+            } else {
+                scoreMuscolo--;
+            }
+
+            if(pianoDelGiorno.tipo.includes('Forza')) {
+                scoreMuscolo++; 
+                if (deficitArrotondato < -200) { 
+                    scoreMuscolo--;
+                }
+            }
+
+            if(scoreMuscolo > 0) {
+                trendMuscoloHtml = '<span class="trend-up trend-muscle">▲</span>';
+            } else if (scoreMuscolo < 0) {
+                trendMuscoloHtml = '<span class="trend-down trend-muscle">▼</span>';
+            }
+            
+            const summaryRow = document.createElement('tr');
+            summaryRow.className = 'day-summary-row';
+            summaryRow.dataset.giornoIndex = giornoIndex;
+            const dataFormatted = dataDelGiorno.toLocaleDateString('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric' });
+            
+            const notaDelGiorno = giorno.note || '';
+            let noteHtml = '<td></td>';
+            if (notaDelGiorno.trim() !== '') {
+                noteHtml = `<td><span class="note-icon" title="Clicca per leggere la nota" data-note="${notaDelGiorno.replace(/"/g, '&quot;')}">ℹ️</span></td>`;
+            }
+
+            summaryRow.innerHTML = `
+                <td><span class="expand-arrow">▶</span> ${dataFormatted}</td>
+                <td>${totaliGiorno.proteine.toFixed(1)} g</td>
+                <td>${totaliGiorno.calorie.toFixed(0)}</td>
+                <td>${workoutCalories} kcal</td>
+                <td>${deficitSurplusText}</td>
+                <td>${testoVariazioneGrasso}</td>
+                <td>${trendMuscoloHtml}</td>
+                ${noteHtml}
+            `;
+            storicoBody.appendChild(summaryRow);
+
+            const detailRow = document.createElement('tr');
+            detailRow.className = 'day-detail-row';
+            const detailCell = document.createElement('td');
+            detailCell.colSpan = 8;
+            detailCell.className = 'detail-cell';
+            
+            let detailHtml = `<h4>Dettaglio Pasti e Alimenti</h4>`;
+
+            if ((giorno.log || []).length > 0) {
+                detailHtml += `<table><tbody>`;
+
+                giorno.log.forEach((entry, pastoIndex) => {
+                    if (entry.type === 'meal') {
+                        const totaliPastoCorrente = (entry.items || []).reduce((acc, item) => {
+                            acc.prot += item.prot || 0;
+                            acc.cal += (item.cal || item.kcal) || 0;
+                            return acc;
+                        }, { prot: 0, cal: 0 });
+
+                        detailHtml += `
+                            <tr class="meal-group-row" data-giorno-index="${giornoIndex}" data-pasto-index="${pastoIndex}">
+                                <td colspan="4"><span class="meal-expand-arrow">▶</span> <strong>${entry.desc}</strong> (Tot: ${totaliPastoCorrente.prot.toFixed(1)}g Prot, ${totaliPastoCorrente.cal.toFixed(0)} Kcal)</td>
+                            </tr>`;
+                        (entry.items || []).forEach(item => {
+                            detailHtml += `<tr class="sub-item-row meal-active" style="display: none;">
+                                            <td style="padding-left: 40px;">${item.desc}</td>
+                                            <td>${item.qta} g</td>
+                                            <td>${(item.prot || 0).toFixed(1)} g</td>
+                                            <td>${((item.cal || item.kcal) || 0).toFixed(0)} Kcal</td>
+                                          </tr>`;
+                        });
+                    } else if (entry.type === 'single') { 
+                        // INIZIO MODIFICA: Corretto 'item' con 'entry'
+                        detailHtml += `<tr><td>${entry.desc}</td><td>${entry.qta} g</td><td>${(entry.prot || 0).toFixed(1)} g</td><td>${((entry.cal || entry.kcal) || 0).toFixed(0)} Kcal</td></tr>`;
+                        // FINE MODIFICA
+                    } else if (entry.type === 'workout') { 
+                         detailHtml += `<tr><td>${entry.desc}</td><td></td><td></td><td>${((entry.cal || entry.kcal) || 0).toFixed(0)} Kcal (bruciate)</td></tr>`;
+                    }
+                });
+                detailHtml += `</tbody></table>`;
+            } else {
+                detailHtml += '<p>Nessun dettaglio alimentare disponibile per questo giorno.</p>';
+            }
+
+            detailCell.innerHTML = detailHtml;
+            detailRow.appendChild(detailCell);
+            storicoBody.appendChild(detailRow);
+        });
+    }
+
+    storicoBody.addEventListener('click', (e) => {
+        const summaryRow = e.target.closest('.day-summary-row');
+        if (summaryRow) {
+            if (!e.target.classList.contains('note-icon')) {
+                summaryRow.classList.toggle('expanded');
+                summaryRow.nextElementSibling.classList.toggle('expanded');
+            }
+        }
+
+        const mealRow = e.target.closest('.meal-group-row');
+        if (mealRow) {
+            mealRow.classList.toggle('expanded');
+            let sibling = mealRow.nextElementSibling;
+            while(sibling && sibling.classList.contains('sub-item-row')) {
+                sibling.style.display = mealRow.classList.contains('expanded') ? 'table-row' : 'none';
+                sibling = sibling.nextElementSibling;
+            }
+        }
+        
+        const noteIcon = e.target.closest('.note-icon');
+        if (noteIcon) {
+            const noteText = noteIcon.dataset.note;
+            alert('Nota del giorno:\n\n' + noteText);
+        }
+    });
+
+    function esportaInExcel() {
+        const storico = caricaTuttoLoStorico();
+        if (storico.length === 0) {
+            alert("Nessun dato da esportare.");
+            return;
+        }
+
+        let csvContent = "Data,Proteine (g),Calorie (kcal),Workout (kcal),Deficit/Surplus (kcal),Variazione Grasso (g),Trend Muscolare\n";
+
+        storico.forEach(giorno => {
+            const dataDelGiorno = new Date(giorno.data);
+            const dataFormatted = dataDelGiorno.toLocaleDateString('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric' });
+
+            const giornoSettimana = dataDelGiorno.getDay();
+            const pianoDelGiorno = PIANO_SETTIMANALE[giornoSettimana] || PIANO_SETTIMANALE[1];
+
+            let totaliGiorno = { proteine: 0, calorie: 0 };
+            let totalWorkoutCaloriesLogged = 0;
+            (giorno.log || []).forEach(entry => {
+                if (entry.type === 'meal' && entry.items) {
+                    entry.items.forEach(item => {
+                        totaliGiorno.proteine += item.prot || 0;
+                        totaliGiorno.calorie += (item.cal || item.kcal) || 0;
+                    });
+                } else if (entry.type === 'single') {
+                    totaliGiorno.proteine += entry.prot || 0;
+                    totaliGiorno.calorie += (entry.cal || entry.kcal) || 0;
+                } else if (entry.type === 'workout') {
+                    totalWorkoutCaloriesLogged += (entry.cal || entry.kcal) || 0;
+                }
+            });
+            const workoutCalories = totalWorkoutCaloriesLogged;
+            const obiettivoCalorieTotale = pianoDelGiorno.cal + workoutCalories;
+            const deficitEffettivo = totaliGiorno.calorie - obiettivoCalorieTotale;
+            const deficitArrotondato = Math.round(deficitEffettivo);
+
+            let variazioneGrasso = 0;
+            if (deficitArrotondato < 0) {
+                variazioneGrasso = (Math.abs(deficitArrotondato) / 7.7);
+            } else if (deficitArrotondato > 0) {
+                variazioneGrasso = -(deficitArrotondato / 7.7);
+            }
+
+            let scoreMuscolo = 0;
+            if (totaliGiorno.proteine >= (pianoDelGiorno.prot * 0.95)) {
+                scoreMuscolo++;
+            } else {
+                scoreMuscolo--;
+            }
+            if (pianoDelGiorno.tipo.includes('Forza')) {
+                scoreMuscolo++;
+                if (deficitArrotondato < -200) {
+                    scoreMuscolo--;
+                }
+            }
+            let trendMuscolareText = 'Neutrale';
+            if (scoreMuscolo > 0) {
+                trendMuscolareText = 'Positivo';
+            } else if (scoreMuscolo < 0) {
+                trendMuscolareText = 'Negativo';
+            }
+
+            csvContent += `"${dataFormatted}",${totaliGiorno.proteine.toFixed(1)},${totaliGiorno.calorie.toFixed(0)},${workoutCalories},${deficitArrotondato},${variazioneGrasso.toFixed(1)},"${trendMuscolareText}"\n`;
+        });
+
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement("a");
+        if (link.download !== undefined) {
+            const url = URL.createObjectURL(blob);
+            link.setAttribute("href", url);
+            link.setAttribute("download", "storico_tracker.csv");
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        } else {
+            alert("Il tuo browser non supporta il download diretto. Copia e incolla il contenuto.");
+        }
+    }
+
+    
+// --- INIZIO CODICE EXPORT STORICO AI (VERSIONE FILE) ---
+    document.getElementById('btn-esporta-storico-ai').addEventListener('click', () => {
+        const storicoGrezzo = caricaTuttoLoStorico(); // Usa la funzione già esistente
+        
+        if (storicoGrezzo.length === 0) {
+            alert("Nessun dato nello storico.");
+            return;
+        }
+
+        // Rielaborazione dati per l'AI
+        const storicoArricchito = storicoGrezzo.map(giorno => {
+            const dataObj = new Date(giorno.data);
+            const dayIndex = dataObj.getDay();
+            const piano = PIANO_SETTIMANALE[dayIndex] || PIANO_SETTIMANALE[1];
+            
+            let stats = { prot: 0, kcal: 0, carb: 0, fat: 0, zuccheri: 0, fibre: 0 };
+            let workoutKcal = 0;
+
+            const logPulito = (giorno.log || []).map(entry => {
+                if (entry.type === 'workout') {
+                    workoutKcal += (entry.kcal || entry.cal || 0);
+                    return { tipo: 'WORKOUT', desc: entry.desc, kcal: (entry.kcal || entry.cal || 0) };
+                } 
+                
+                const items = entry.type === 'meal' ? entry.items : [entry];
+                let entryKcal = 0;
+                
+                const itemsDetails = items.map(i => {
+                    stats.prot += (i.prot || 0);
+                    stats.kcal += (i.kcal || i.cal || 0);
+                    stats.carb += (i.carb || 0);
+                    stats.fat += (i.fatTotal || 0);
+                    stats.zuccheri += (i.zuccheri || 0);
+                    stats.fibre += (i.fibreTotali || 0);
+                    entryKcal += (i.kcal || i.cal || 0);
+                    return `${i.desc} (${i.qta}g)`;
+                });
+
+                return {
+                    pasto: entry.desc || "Alimento Singolo",
+                    kcal_totali: entryKcal.toFixed(0),
+                    dettaglio: itemsDetails.join(", ")
+                };
+            });
+
+            return {
+                data: giorno.data,
+                giorno_settimana: dataObj.toLocaleDateString('it-IT', { weekday: 'long' }),
+                contesto: {
+                    tipo_giornata: piano.tipo,
+                    obiettivo_kcal_base: piano.cal,
+                    obiettivo_prot: piano.prot,
+                    allenamento_kcal: workoutKcal
+                },
+                totali_raggiunti: {
+                    kcal: stats.kcal.toFixed(0),
+                    prot: stats.prot.toFixed(1),
+                    carb: stats.carb.toFixed(1),
+                    grassi: stats.fat.toFixed(1),
+                    zuccheri: stats.zuccheri.toFixed(1),
+                    fibre: stats.fibre.toFixed(1)
+                },
+                bilancio_calorico: (stats.kcal - (piano.cal + workoutKcal + (giorno.calorieAdjustment || 0))).toFixed(0),
+                note_utente: giorno.note || "",
+                diario_alimentare: logPulito
+            };
+        });
+
+        const jsonExport = {
+            descrizione: "Storico completo abitudini alimentari per Analisi AI",
+            generato_il: new Date().toISOString(),
+            numero_giorni: storicoArricchito.length,
+            dati: storicoArricchito
+        };
+
+        // --- SALVATAGGIO FILE JSON ---
+        const jsonString = JSON.stringify(jsonExport, null, 2);
+        const blob = new Blob([jsonString], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        // Nome del file con la data di oggi
+        link.download = `storico_tracker_ai_${new Date().toISOString().split('T')[0]}.json`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+    });
+    // --- FINE CODICE EXPORT STORICO AI ---
+    renderStorico();
+});
+</script>
+    <script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js')
+        .then(reg => console.log('App registrata', reg.scope))
+        .catch(err => console.log('Errore App', err));
+    });
+  }
+</script>
+</body>
+</html>
+
+
+
+
+
+
